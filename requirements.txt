@@ -1,0 +1,6 @@
+python-telegram-bot==21.4  # Or the version you're using (v20+ for Application API)
+aiohttp==3.9.5
+requests==2.32.3
+python-dotenv==1.0.1
+web3==6.20.0
+py-clob-client==0.10.0  # Check the exact version from your local setup; pip show py-clob-client
