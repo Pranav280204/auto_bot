@@ -8,7 +8,7 @@ from py_clob_client.clob_types import MarketOrderArgs, OrderType
 from py_clob_client.order_builder.constants import BUY, SELL
 import aiohttp
 import asyncio
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 import time
 
 # Telegram imports
@@ -22,6 +22,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest  # For custom timeouts
+import telegram.error  # For TimedOut exception
 
 # Load environment variables
 load_dotenv()
@@ -158,8 +159,13 @@ def place_market_order(token_id, amount, side):
 
 async def check_for_new_tweets(session, application):
     global LAST_CHECKED_TIME
-    until_time = datetime.now(timezone.utc)
-    since_time = LAST_CHECKED_TIME
+    
+    now = datetime.now(timezone.utc)
+    
+    # Add overlap buffer to reliably catch tweets (30s backward, 5s forward) — keeps your current good performance
+    since_time = LAST_CHECKED_TIME - timedelta(seconds=30)
+    until_time = now + timedelta(seconds=5)
+    
     since_str = since_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
     until_str = until_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
 
@@ -170,6 +176,8 @@ async def check_for_new_tweets(session, application):
 
     all_tweets = []
     next_cursor = None
+
+    detection_start = time.time()  # Timing start
 
     while True:
         if next_cursor:
@@ -188,13 +196,34 @@ async def check_for_new_tweets(session, application):
                 break
 
     if all_tweets:
+        detection_end = time.time()
+        print(f"DETECTION TOOK {detection_end - detection_start:.3f}s (API fetch + processing)")
+
         chat_id = application.bot_data['chat_id']
+        token_id = application.bot_data['token_id']
+        sell_amount = application.bot_data['sell_amount']
+
+        # ────────────────────────────────
+        # PRIORITY: EXECUTE SELL IMMEDIATELY
+        # ────────────────────────────────
+        sell_start = time.time()
+        result = place_market_order(token_id, sell_amount, SELL)
+        sell_end = time.time()
+        sell_duration = sell_end - sell_start
+        print(f"SELL EXECUTED in {sell_duration:.3f}s → Response: {result}")
+
+        # Quick confirmation right after sell
+        await safe_send_message(application.bot, chat_id, f"🚨 SELL ORDER PLACED! (took {sell_duration:.2f}s)")
+
+        # ────────────────────────────────
+        # THEN: Full detection notification (non-critical)
+        # ────────────────────────────────
         message = f"{'═' * 60}\nDETECTED {len(all_tweets)} NEW ACTIVITIES FROM @{TARGET_ACCOUNT}!\n{'═' * 60}\n\n"
         for tweet in all_tweets:
             created_str = tweet.get('createdAt', '??')
             try:
                 tweet_time = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
-                latency = (until_time - tweet_time).total_seconds()
+                latency = (now - tweet_time).total_seconds()
                 latency_str = f"{latency:.2f}s ago"
                 time_str = tweet_time.strftime('%Y-%m-%d %H:%M:%S UTC')
             except:
@@ -211,20 +240,21 @@ async def check_for_new_tweets(session, application):
 
         await safe_send_message(application.bot, chat_id, message)
 
-        token_id = application.bot_data['token_id']
-        sell_amount = application.bot_data['sell_amount']
-        place_market_order(token_id, sell_amount, SELL)
-        await safe_send_message(application.bot, chat_id, "SELL ORDER PLACED!")
+        # Final timing summary
+        total_cycle = sell_end - detection_start
+        print(f"TOTAL TIME FROM DETECTION TO SELL COMPLETE: {total_cycle:.3f}s")
+        await safe_send_message(application.bot, chat_id, f"Full cycle (detect → sell): {total_cycle:.2f}s")
 
-    LAST_CHECKED_TIME = until_time
+    # Update last checked time to current now
+    LAST_CHECKED_TIME = now
 
 async def safe_send_message(bot, chat_id, text):
     try:
         await bot.send_message(chat_id=chat_id, text=text)
     except telegram.error.TimedOut:
         print("Timeout on send_message - retrying once...")
-        await asyncio.sleep(5)  # Short delay
-        await bot.send_message(chat_id=chat_id, text=text)  # Retry
+        await asyncio.sleep(5)
+        await bot.send_message(chat_id=chat_id, text=text)
 
 async def monitor_elon_activity(application: Application):
     print("Monitoring loop started")
@@ -233,13 +263,13 @@ async def monitor_elon_activity(application: Application):
             start_time = time.time()
             await check_for_new_tweets(session, application)
             duration = time.time() - start_time
-            print(f"Check completed in {duration:.2f}s", end="\r", flush=True)
+            print(f"Check completed in {duration:.3f}s", end="\r", flush=True)
             sleep_time = max(0, CHECK_INTERVAL - duration)
             await asyncio.sleep(sleep_time)
     print("Monitoring loop ended")
 
 # ────────────────────────────────────────────────
-# Telegram Handlers
+# Telegram Handlers (unchanged)
 # ────────────────────────────────────────────────
 
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
