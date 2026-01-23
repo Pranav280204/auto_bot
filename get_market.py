@@ -22,6 +22,7 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest  # For custom timeouts
+import telegram.error  # For exception handling
 
 # Load environment variables
 load_dotenv()
@@ -419,7 +420,7 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
         await update.message.reply_text("Not monitoring.")
 
 # ────────────────────────────────────────────────
-# Main
+# Main with Webhook Setup
 # ────────────────────────────────────────────────
 def main():
     # Custom request with increased timeouts
@@ -455,8 +456,22 @@ def main():
     application.add_handler(CommandHandler("stop", stop_monitor))
     application.add_handler(CommandHandler("status", status))
 
-    print("Telegram bot started. Use /start in your chat.")
-    application.run_polling(allowed_updates=Update.ALL_TYPES)
+    # Webhook setup for Railway
+    port = int(os.environ.get('PORT', 8443))
+    webhook_url = os.environ.get('RAILWAY_STATIC_URL', f'https://{os.environ.get("RAILWAY_SERVICE_NAME", "your-bot")}.railway.app') + '/webhook'
+    
+    # Set webhook
+    application.bot.set_webhook(webhook_url)
+    
+    print(f"Telegram bot started with webhook: {webhook_url}")
+    
+    # Run with webhook
+    application.run_webhook(
+        listen='0.0.0.0',
+        port=port,
+        url_path='/webhook',
+        webhook_url=webhook_url
+    )
 
 if __name__ == "__main__":
     print("⚠️ REAL MONEY TRADING — keep DRY_RUN=true until tested!")
