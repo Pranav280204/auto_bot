@@ -21,6 +21,7 @@ from telegram.ext import (
     ConversationHandler,
     ContextTypes,
 )
+from telegram.request import HTTPXRequest  # For custom timeouts
 
 # Load environment variables
 load_dotenv()
@@ -208,14 +209,22 @@ async def check_for_new_tweets(session, application):
                 message += f"{preview}\n"
             message += "─" * 70 + "\n"
 
-        await application.bot.send_message(chat_id=chat_id, text=message)
+        await safe_send_message(application.bot, chat_id, message)
 
         token_id = application.bot_data['token_id']
         sell_amount = application.bot_data['sell_amount']
         place_market_order(token_id, sell_amount, SELL)
-        await application.bot.send_message(chat_id=chat_id, text="SELL ORDER PLACED!")
+        await safe_send_message(application.bot, chat_id, "SELL ORDER PLACED!")
 
     LAST_CHECKED_TIME = until_time
+
+async def safe_send_message(bot, chat_id, text):
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+    except telegram.error.TimedOut:
+        print("Timeout on send_message - retrying once...")
+        await asyncio.sleep(5)  # Short delay
+        await bot.send_message(chat_id=chat_id, text=text)  # Retry
 
 async def monitor_elon_activity(application: Application):
     print("Monitoring loop started")
@@ -413,7 +422,17 @@ async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
 # Main
 # ────────────────────────────────────────────────
 def main():
-    application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
+    # Custom request with increased timeouts
+    custom_request = HTTPXRequest(
+        connection_pool_size=10,
+        read_timeout=30,
+        write_timeout=30,
+        connect_timeout=30,
+        pool_timeout=30,
+        media_write_timeout=60
+    )
+
+    application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(custom_request).build()
 
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
