@@ -22,7 +22,7 @@ from telegram.ext import (
     ContextTypes,
 )
 
-# Load environment variables (for local testing; Render uses dashboard env vars)
+# Load environment variables
 load_dotenv()
 
 # Polymarket configs
@@ -31,18 +31,15 @@ WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
-WEBHOOK_URL = os.getenv("WEBHOOK_URL")  # Required for Render webhook deployment
 
 if not PRIVATE_KEY:
-    raise ValueError("PRIVATE_KEY is missing")
+    raise ValueError("PRIVATE_KEY is missing in .env")
 if not WALLET_ADDRESS:
-    raise ValueError("WALLET_ADDRESS is missing")
+    raise ValueError("WALLET_ADDRESS is missing in .env")
 if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN is missing")
+    raise ValueError("TELEGRAM_BOT_TOKEN is missing in .env")
 if not TWITTER_API_KEY:
-    raise ValueError("TWITTER_API_KEY is missing")
-if not WEBHOOK_URL:
-    raise ValueError("WEBHOOK_URL is required for webhook mode (set in Render env vars)")
+    raise ValueError("TWITTER_API_KEY is missing in .env")
 
 # Constants
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -61,13 +58,13 @@ ERC1155_ABI = [
     }
 ]
 
-# Initialize Web3 and ClobClient (signature_type=1 for Magic/email wallets; change to 0 for standard EOA)
+# Initialize Web3 and ClobClient
 w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
 client = ClobClient(
     host=CLOB_API,
     key=PRIVATE_KEY,
     chain_id=137,
-    signature_type=1,  # Change to 0 if using standard MetaMask/EOA wallet
+    signature_type=1,
     funder=WALLET_ADDRESS
 )
 
@@ -77,10 +74,14 @@ try:
     print("API credentials set successfully")
 except Exception as e:
     print(f"API creds error: {e}")
-    raise
+    exit(1)
 
 print(f"Connected to Polymarket with wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}")
 print(f"Dry run mode: {DRY_RUN}")
+print("\n⚠️ REQUIRED APPROVALS (do once):")
+print("• BUY: Approve USDC to exchange contracts")
+print("• SELL: setApprovalForAll on Conditional Tokens for exchange contracts")
+print("Exchange addrs: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E & 0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296\n")
 
 # Twitter monitoring configs
 TARGET_ACCOUNT = "elonmusk"
@@ -89,7 +90,15 @@ PRINT_FULL_TEXT = True
 LAST_CHECKED_TIME = datetime.now(timezone.utc)
 
 # Conversation states
-SLUG, MARKET_IDX, OUTCOME_IDX, ACTION, BUY_AMOUNT, CONFIRM_BUY, SELL_CHOICE, CUSTOM_SELL, START_MONITOR = range(9)
+SLUG = 0
+MARKET_IDX = 1
+OUTCOME_IDX = 2
+ACTION = 3
+BUY_AMOUNT = 4
+CONFIRM_BUY = 5
+SELL_CHOICE = 6
+CUSTOM_SELL = 7
+START_MONITOR = 8
 
 def fetch_active_markets(slug):
     url = f"{GAMMA_API}/events/slug/{slug}"
@@ -146,7 +155,7 @@ def place_market_order(token_id, amount, side):
         print(f"Order placement failed: {e}")
         return None
 
-async def check_for_new_tweets(session, application: Application):
+async def check_for_new_tweets(session, application):
     global LAST_CHECKED_TIME
     until_time = datetime.now(timezone.utc)
     since_time = LAST_CHECKED_TIME
@@ -173,44 +182,38 @@ async def check_for_new_tweets(session, application: Application):
                     next_cursor = data.get("next_cursor")
                 else:
                     break
-            elif response.status == 429:
-                print("Rate limit hit – sleeping 10 seconds")
-                await asyncio.sleep(10)
-                break
             else:
                 print(f"Twitter API Error: {response.status}")
                 break
 
     if all_tweets:
-        chat_id = application.bot_data.get('chat_id')
-        if chat_id:
-            message = f"{'═' * 60}\nDETECTED {len(all_tweets)} NEW ACTIVITIES FROM @{TARGET_ACCOUNT}!\n{'═' * 60}\n\n"
-            for tweet in all_tweets:
-                created_str = tweet.get('createdAt', '??')
-                try:
-                    tweet_time = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
-                    latency = (until_time - tweet_time).total_seconds()
-                    latency_str = f"{latency:.2f}s ago"
-                    time_str = tweet_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-                except:
-                    latency_str = "??"
-                    time_str = "??"
-                message += f"[{time_str}] {latency_str}\n"
-                text = tweet.get('text', '').strip()
-                if PRINT_FULL_TEXT:
-                    message += f"{text}\n"
-                else:
-                    preview = text[:90] + "…" if len(text) > 90 else text
-                    message += f"{preview}\n"
-                message += "─" * 70 + "\n"
+        chat_id = application.bot_data['chat_id']
+        message = f"{'═' * 60}\nDETECTED {len(all_tweets)} NEW ACTIVITIES FROM @{TARGET_ACCOUNT}!\n{'═' * 60}\n\n"
+        for tweet in all_tweets:
+            created_str = tweet.get('createdAt', '??')
+            try:
+                tweet_time = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+                latency = (until_time - tweet_time).total_seconds()
+                latency_str = f"{latency:.2f}s ago"
+                time_str = tweet_time.strftime('%Y-%m-%d %H:%M:%S UTC')
+            except:
+                latency_str = "??"
+                time_str = "??"
+            message += f"[{time_str}] {latency_str}\n"
+            text = tweet.get('text', '').strip()
+            if PRINT_FULL_TEXT:
+                message += f"{text}\n"
+            else:
+                preview = text[:90] + "…" if len(text) > 90 else text
+                message += f"{preview}\n"
+            message += "─" * 70 + "\n"
 
-            await application.bot.send_message(chat_id=chat_id, text=message)
+        await application.bot.send_message(chat_id=chat_id, text=message)
 
-            token_id = application.bot_data.get('token_id')
-            sell_amount = application.bot_data.get('sell_amount')
-            if token_id and sell_amount:
-                place_market_order(token_id, sell_amount, SELL)
-                await application.bot.send_message(chat_id=chat_id, text="AUTO-SELL ORDER PLACED!")
+        token_id = application.bot_data['token_id']
+        sell_amount = application.bot_data['sell_amount']
+        place_market_order(token_id, sell_amount, SELL)
+        await application.bot.send_message(chat_id=chat_id, text="SELL ORDER PLACED!")
 
     LAST_CHECKED_TIME = until_time
 
@@ -226,7 +229,10 @@ async def monitor_elon_activity(application: Application):
             await asyncio.sleep(sleep_time)
     print("Monitoring loop ended")
 
+# ────────────────────────────────────────────────
 # Telegram Handlers
+# ────────────────────────────────────────────────
+
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     await update.message.reply_text("Enter Polymarket event slug (e.g. elon-musk-of-tweets-january-16-january-23):")
     return SLUG
@@ -331,7 +337,7 @@ async def confirm_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
         place_market_order(token_id, usdc, BUY)
         sell_amount = get_balance(token_id)
         context.user_data['sell_amount'] = sell_amount
-        await update.message.reply_text(f"Initial BUY placed. Will auto-sell all {sell_amount:.4f} shares on Elon activity.\n\nStart monitoring? (y/n)")
+        await update.message.reply_text(f"Will auto-sell all {sell_amount:.4f} shares on Elon activity.\n\nStart monitoring? (y/n)")
         return START_MONITOR
     else:
         await update.message.reply_text("Cancelled.")
@@ -383,7 +389,7 @@ async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
         context.bot_data['chat_id'] = update.effective_chat.id
         context.bot_data['monitoring'] = True
         context.application.create_task(monitor_elon_activity(context.application))
-        await update.message.reply_text("Monitoring started! I'll notify you on Elon activity and auto-sell.")
+        await update.message.reply_text("Monitoring started! I'll notify you here on Elon activity and sells.")
         return ConversationHandler.END
     else:
         await update.message.reply_text("Cancelled.")
@@ -399,10 +405,13 @@ async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> No
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
     if context.bot_data.get('monitoring', False):
-        await update.message.reply_text("Monitoring is ACTIVE.")
+        await update.message.reply_text("Monitoring is active.")
     else:
-        await update.message.reply_text("Monitoring is NOT active.")
+        await update.message.reply_text("Not monitoring.")
 
+# ────────────────────────────────────────────────
+# Main
+# ────────────────────────────────────────────────
 def main():
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
@@ -427,20 +436,9 @@ def main():
     application.add_handler(CommandHandler("stop", stop_monitor))
     application.add_handler(CommandHandler("status", status))
 
-    print("Telegram bot starting with webhooks...")
-
-    port = int(os.environ.get("PORT", 8443))
-    url_path = TELEGRAM_BOT_TOKEN
-    secret_token = os.getenv("WEBHOOK_SECRET_TOKEN", "super_secret_token_change_this")
-
-    application.run_webhook(
-        listen="0.0.0.0",
-        port=port,
-        url_path=url_path,
-        webhook_url=WEBHOOK_URL,
-        secret_token=secret_token,
-    )
+    print("Telegram bot started. Use /start in your chat.")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
 
 if __name__ == "__main__":
-    print("⚠️ REAL MONEY TRADING — keep DRY_RUN=true until fully tested!")
+    print("⚠️ REAL MONEY TRADING — keep DRY_RUN=true until tested!")
     main()
