@@ -273,7 +273,6 @@ async def monitor_elon_activity(application: Application):
             loop_start = time.time()
             await check_for_new_tweets(session, application)
             duration = time.time() - loop_start
-            print(f"Poll cycle: {duration:.3f}s", end="\r", flush=True)
             sleep_time = max(0, CHECK_INTERVAL - duration)
             await asyncio.sleep(sleep_time)
     print("Monitoring stopped")
@@ -478,7 +477,8 @@ async def get_auto_buy_yn(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return AUTO_BUY_AMOUNT
     else:
         context.user_data['buy_usdc'] = 0
-        await update.message.reply_text(await build_confirm_message(update, context))
+        msg = await build_confirm_message(context)
+        await update.message.reply_text(msg)
         return START_MONITOR
 
 async def get_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -487,13 +487,14 @@ async def get_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         if amount <= 0:
             raise ValueError
         context.user_data['buy_usdc'] = amount
-        await update.message.reply_text(await build_confirm_message(update, context))
+        msg = await build_confirm_message(context)
+        await update.message.reply_text(msg)
         return START_MONITOR
     except:
         await update.message.reply_text("Invalid amount.")
         return AUTO_BUY_AMOUNT
 
-async def build_confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+async def build_confirm_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     from_o = context.user_data['outcome1']
     target_o = context.user_data.get('outcome2') or from_o
     sell_amt = context.user_data.get('sell_amount', 0)
