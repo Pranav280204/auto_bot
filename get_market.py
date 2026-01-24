@@ -99,12 +99,11 @@ SLUG = 0
 MARKET_IDX = 1
 OUTCOME_IDX = 2
 RANGE_CONFIG = 3
-BUY_RANGE_1 = 4
-SELL_RANGE_1 = 5
-USE_RANGE_2 = 6
-BUY_RANGE_2 = 7
-SELL_RANGE_2 = 8
-CONFIRM_CONFIG = 9
+BUY_AMOUNT_1 = 4
+SELL_AMOUNT_1 = 5
+BUY_AMOUNT_2 = 6
+SELL_AMOUNT_2 = 7
+CONFIRM_CONFIG = 8
 
 
 def fetch_active_markets(slug):
@@ -534,259 +533,117 @@ async def get_range_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -
     
     await update.message.reply_text(
         "📈 RANGE 1 - BUY CONFIGURATION\n\n"
-        "Enter buy price range (min,max) or 'skip' to skip buying:\n"
-        "Example: 0.45,0.55"
+        "Enter USDC amount to BUY when tweet detected\n"
+        "(or enter 0 to skip buying):\n"
+        "Example: 50"
     )
-    return BUY_RANGE_1
-
-
-async def get_buy_range_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get buy range for range 1"""
-    text = update.message.text.strip().lower()
-    
-    if text == 'skip':
-        context.user_data['range_1_buy'] = None
-        context.user_data['range_1_buy_amount'] = 0
-    else:
-        try:
-            parts = text.split(',')
-            if len(parts) != 2:
-                raise ValueError
-            
-            buy_min = float(parts[0].strip())
-            buy_max = float(parts[1].strip())
-            
-            if buy_min >= buy_max or buy_min < 0 or buy_max > 1:
-                raise ValueError
-            
-            context.user_data['range_1_buy'] = (buy_min, buy_max)
-            
-            await update.message.reply_text(
-                f"✅ Buy range 1: {buy_min:.4f} - {buy_max:.4f}\n\n"
-                f"Enter USDC amount to buy when triggered:"
-            )
-            return BUY_AMOUNT_1
-        except:
-            await update.message.reply_text(
-                "❌ Invalid format. Use 'min,max' or 'skip':"
-            )
-            return BUY_RANGE_1
-    
-    await update.message.reply_text(
-        "📉 RANGE 1 - SELL CONFIGURATION\n\n"
-        "Enter sell price range (min,max) or 'skip' to skip selling:\n"
-        "Example: 0.65,0.75"
-    )
-    return SELL_RANGE_1
+    return BUY_AMOUNT_1
 
 
 async def get_buy_amount_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Get buy amount for range 1"""
     try:
         amount = float(update.message.text.strip())
-        if amount <= 0:
+        if amount < 0:
             raise ValueError
         
         context.user_data['range_1_buy_amount'] = amount
         
-        await update.message.reply_text(
-            f"✅ Will buy ${amount:.2f} USDC worth\n\n"
-            f"📉 RANGE 1 - SELL CONFIGURATION\n\n"
-            f"Enter sell price range (min,max) or 'skip' to skip selling:\n"
-            f"Example: 0.65,0.75"
-        )
-        return SELL_RANGE_1
+        if amount > 0:
+            await update.message.reply_text(
+                f"✅ Will BUY ${amount:.2f} USDC at market price\n\n"
+                f"📉 RANGE 1 - SELL CONFIGURATION\n\n"
+                f"Enter number of shares to SELL when tweet detected\n"
+                f"(or enter 0 to skip selling):"
+            )
+        else:
+            await update.message.reply_text(
+                f"⏭️ Buy disabled for Range 1\n\n"
+                f"📉 RANGE 1 - SELL CONFIGURATION\n\n"
+                f"Enter number of shares to SELL when tweet detected\n"
+                f"(or enter 0 to skip selling):"
+            )
+        return SELL_AMOUNT_1
     except:
-        await update.message.reply_text("❌ Invalid amount. Try again:")
+        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
         return BUY_AMOUNT_1
-
-
-# Additional state for buy amount
-BUY_AMOUNT_1 = 100
-BUY_AMOUNT_2 = 101
-SELL_AMOUNT_1 = 102
-SELL_AMOUNT_2 = 103
-
-
-async def get_sell_range_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get sell range for range 1"""
-    text = update.message.text.strip().lower()
-    
-    if text == 'skip':
-        context.user_data['range_1_sell'] = None
-        context.user_data['range_1_sell_amount'] = 0
-    else:
-        try:
-            parts = text.split(',')
-            if len(parts) != 2:
-                raise ValueError
-            
-            sell_min = float(parts[0].strip())
-            sell_max = float(parts[1].strip())
-            
-            if sell_min >= sell_max or sell_min < 0 or sell_max > 1:
-                raise ValueError
-            
-            context.user_data['range_1_sell'] = (sell_min, sell_max)
-            
-            await update.message.reply_text(
-                f"✅ Sell range 1: {sell_min:.4f} - {sell_max:.4f}\n\n"
-                f"Enter number of shares to sell when triggered:"
-            )
-            return SELL_AMOUNT_1
-        except:
-            await update.message.reply_text(
-                "❌ Invalid format. Use 'min,max' or 'skip':"
-            )
-            return SELL_RANGE_1
-    
-    # Check if we need range 2
-    if context.user_data.get('num_ranges') == 2:
-        await update.message.reply_text(
-            "📈 RANGE 2 - BUY CONFIGURATION\n\n"
-            "Enter buy price range (min,max) or 'skip':\n"
-            "Example: 0.30,0.40"
-        )
-        return BUY_RANGE_2
-    else:
-        # Show summary and confirm
-        return await show_confirmation(update, context)
 
 
 async def get_sell_amount_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Get sell amount for range 1"""
     try:
         amount = float(update.message.text.strip())
-        if amount <= 0:
+        if amount < 0:
             raise ValueError
         
         context.user_data['range_1_sell_amount'] = amount
         
         # Check if we need range 2
         if context.user_data.get('num_ranges') == 2:
-            await update.message.reply_text(
-                f"✅ Will sell {amount:.2f} shares\n\n"
-                f"📈 RANGE 2 - BUY CONFIGURATION\n\n"
-                f"Enter buy price range (min,max) or 'skip':\n"
-                f"Example: 0.30,0.40"
-            )
-            return BUY_RANGE_2
+            if amount > 0:
+                await update.message.reply_text(
+                    f"✅ Will SELL {amount:.2f} shares at market price\n\n"
+                    f"📈 RANGE 2 - BUY CONFIGURATION\n\n"
+                    f"Enter USDC amount to BUY when tweet detected\n"
+                    f"(or enter 0 to skip):"
+                )
+            else:
+                await update.message.reply_text(
+                    f"⏭️ Sell disabled for Range 1\n\n"
+                    f"📈 RANGE 2 - BUY CONFIGURATION\n\n"
+                    f"Enter USDC amount to BUY when tweet detected\n"
+                    f"(or enter 0 to skip):"
+                )
+            return BUY_AMOUNT_2
         else:
             # Show summary and confirm
             return await show_confirmation(update, context)
     except:
-        await update.message.reply_text("❌ Invalid amount. Try again:")
+        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
         return SELL_AMOUNT_1
-
-
-async def get_buy_range_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get buy range for range 2"""
-    text = update.message.text.strip().lower()
-    
-    if text == 'skip':
-        context.user_data['range_2_buy'] = None
-        context.user_data['range_2_buy_amount'] = 0
-    else:
-        try:
-            parts = text.split(',')
-            if len(parts) != 2:
-                raise ValueError
-            
-            buy_min = float(parts[0].strip())
-            buy_max = float(parts[1].strip())
-            
-            if buy_min >= buy_max or buy_min < 0 or buy_max > 1:
-                raise ValueError
-            
-            context.user_data['range_2_buy'] = (buy_min, buy_max)
-            
-            await update.message.reply_text(
-                f"✅ Buy range 2: {buy_min:.4f} - {buy_max:.4f}\n\n"
-                f"Enter USDC amount to buy when triggered:"
-            )
-            return BUY_AMOUNT_2
-        except:
-            await update.message.reply_text(
-                "❌ Invalid format. Use 'min,max' or 'skip':"
-            )
-            return BUY_RANGE_2
-    
-    await update.message.reply_text(
-        "📉 RANGE 2 - SELL CONFIGURATION\n\n"
-        "Enter sell price range (min,max) or 'skip':\n"
-        "Example: 0.80,0.90"
-    )
-    return SELL_RANGE_2
 
 
 async def get_buy_amount_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Get buy amount for range 2"""
     try:
         amount = float(update.message.text.strip())
-        if amount <= 0:
+        if amount < 0:
             raise ValueError
         
         context.user_data['range_2_buy_amount'] = amount
         
-        await update.message.reply_text(
-            f"✅ Will buy ${amount:.2f} USDC worth\n\n"
-            f"📉 RANGE 2 - SELL CONFIGURATION\n\n"
-            f"Enter sell price range (min,max) or 'skip':\n"
-            f"Example: 0.80,0.90"
-        )
-        return SELL_RANGE_2
+        if amount > 0:
+            await update.message.reply_text(
+                f"✅ Will BUY ${amount:.2f} USDC at market price\n\n"
+                f"📉 RANGE 2 - SELL CONFIGURATION\n\n"
+                f"Enter number of shares to SELL when tweet detected\n"
+                f"(or enter 0 to skip):"
+            )
+        else:
+            await update.message.reply_text(
+                f"⏭️ Buy disabled for Range 2\n\n"
+                f"📉 RANGE 2 - SELL CONFIGURATION\n\n"
+                f"Enter number of shares to SELL when tweet detected\n"
+                f"(or enter 0 to skip):"
+            )
+        return SELL_AMOUNT_2
     except:
-        await update.message.reply_text("❌ Invalid amount. Try again:")
+        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
         return BUY_AMOUNT_2
-
-
-async def get_sell_range_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get sell range for range 2"""
-    text = update.message.text.strip().lower()
-    
-    if text == 'skip':
-        context.user_data['range_2_sell'] = None
-        context.user_data['range_2_sell_amount'] = 0
-    else:
-        try:
-            parts = text.split(',')
-            if len(parts) != 2:
-                raise ValueError
-            
-            sell_min = float(parts[0].strip())
-            sell_max = float(parts[1].strip())
-            
-            if sell_min >= sell_max or sell_min < 0 or sell_max > 1:
-                raise ValueError
-            
-            context.user_data['range_2_sell'] = (sell_min, sell_max)
-            
-            await update.message.reply_text(
-                f"✅ Sell range 2: {sell_min:.4f} - {sell_max:.4f}\n\n"
-                f"Enter number of shares to sell when triggered:"
-            )
-            return SELL_AMOUNT_2
-        except:
-            await update.message.reply_text(
-                "❌ Invalid format. Use 'min,max' or 'skip':"
-            )
-            return SELL_RANGE_2
-    
-    return await show_confirmation(update, context)
 
 
 async def get_sell_amount_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     """Get sell amount for range 2"""
     try:
         amount = float(update.message.text.strip())
-        if amount <= 0:
+        if amount < 0:
             raise ValueError
         
         context.user_data['range_2_sell_amount'] = amount
         
         return await show_confirmation(update, context)
     except:
-        await update.message.reply_text("❌ Invalid amount. Try again:")
+        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
         return SELL_AMOUNT_2
 
 
@@ -799,38 +656,51 @@ async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     summary += f"🎯 Outcome: {context.user_data['selected']}\n"
     summary += f"🔢 Token ID: {context.user_data['token_id']}\n\n"
     
+    summary += "⚡ ON EVERY TWEET DETECTION:\n\n"
+    
     # Range 1
     summary += "📊 RANGE 1:\n"
-    if context.user_data.get('range_1_buy'):
-        buy_min, buy_max = context.user_data['range_1_buy']
-        buy_amt = context.user_data.get('range_1_buy_amount', 0)
-        summary += f"  📈 BUY: ${buy_amt:.2f} when price in [{buy_min:.4f}, {buy_max:.4f}]\n"
+    buy_amt_1 = context.user_data.get('range_1_buy_amount', 0)
+    sell_amt_1 = context.user_data.get('range_1_sell_amount', 0)
+    
+    if buy_amt_1 > 0:
+        summary += f"  📈 BUY ${buy_amt_1:.2f} USDC at market price\n"
     else:
         summary += f"  📈 BUY: Disabled\n"
     
-    if context.user_data.get('range_1_sell'):
-        sell_min, sell_max = context.user_data['range_1_sell']
-        sell_amt = context.user_data.get('range_1_sell_amount', 0)
-        summary += f"  📉 SELL: {sell_amt:.2f} shares when price in [{sell_min:.4f}, {sell_max:.4f}]\n"
+    if sell_amt_1 > 0:
+        summary += f"  📉 SELL {sell_amt_1:.2f} shares at market price\n"
     else:
         summary += f"  📉 SELL: Disabled\n"
     
     # Range 2 if configured
     if context.user_data.get('num_ranges') == 2:
         summary += "\n📊 RANGE 2:\n"
-        if context.user_data.get('range_2_buy'):
-            buy_min, buy_max = context.user_data['range_2_buy']
-            buy_amt = context.user_data.get('range_2_buy_amount', 0)
-            summary += f"  📈 BUY: ${buy_amt:.2f} when price in [{buy_min:.4f}, {buy_max:.4f}]\n"
+        buy_amt_2 = context.user_data.get('range_2_buy_amount', 0)
+        sell_amt_2 = context.user_data.get('range_2_sell_amount', 0)
+        
+        if buy_amt_2 > 0:
+            summary += f"  📈 BUY ${buy_amt_2:.2f} USDC at market price\n"
         else:
             summary += f"  📈 BUY: Disabled\n"
         
-        if context.user_data.get('range_2_sell'):
-            sell_min, sell_max = context.user_data['range_2_sell']
-            sell_amt = context.user_data.get('range_2_sell_amount', 0)
-            summary += f"  📉 SELL: {sell_amt:.2f} shares when price in [{sell_min:.4f}, {sell_max:.4f}]\n"
+        if sell_amt_2 > 0:
+            summary += f"  📉 SELL {sell_amt_2:.2f} shares at market price\n"
         else:
             summary += f"  📉 SELL: Disabled\n"
+    
+    # Calculate totals
+    total_buy = buy_amt_1 + context.user_data.get('range_2_buy_amount', 0)
+    total_sell = sell_amt_1 + context.user_data.get('range_2_sell_amount', 0)
+    
+    summary += "\n" + "─" * 50 + "\n"
+    summary += "💰 TOTAL PER TWEET:\n"
+    if total_buy > 0:
+        summary += f"  BUY: ${total_buy:.2f} USDC\n"
+    if total_sell > 0:
+        summary += f"  SELL: {total_sell:.2f} shares\n"
+    if total_buy == 0 and total_sell == 0:
+        summary += "  ⚠️ No trades configured!\n"
     
     summary += "\n" + "═" * 50 + "\n"
     summary += "Start monitoring? (y/n)"
@@ -849,18 +719,14 @@ async def confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
     context.bot_data['token_id'] = context.user_data['token_id']
     context.bot_data['chat_id'] = update.effective_chat.id
     
-    # Build range configurations
+    # Build range configurations (simplified - just amounts)
     range_1 = {
-        'buy_range': context.user_data.get('range_1_buy'),
         'buy_amount': context.user_data.get('range_1_buy_amount', 0),
-        'sell_range': context.user_data.get('range_1_sell'),
         'sell_amount': context.user_data.get('range_1_sell_amount', 0)
     }
     
     range_2 = {
-        'buy_range': context.user_data.get('range_2_buy'),
         'buy_amount': context.user_data.get('range_2_buy_amount', 0),
-        'sell_range': context.user_data.get('range_2_sell'),
         'sell_amount': context.user_data.get('range_2_sell_amount', 0)
     }
     
@@ -878,7 +744,8 @@ async def confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         "✅ Monitoring started!\n\n"
         f"🔍 Watching @{TARGET_ACCOUNT}\n"
         f"⚡ Check interval: {CHECK_INTERVAL}s\n"
-        f"📊 Ranges configured: {context.user_data.get('num_ranges')}\n\n"
+        f"📊 Ranges configured: {context.user_data.get('num_ranges')}\n"
+        f"💰 Trades execute at MARKET PRICE\n\n"
         "Use /stop to stop monitoring\n"
         "Use /status to check status"
     )
@@ -942,13 +809,9 @@ def main():
             MARKET_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_market_idx)],
             OUTCOME_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_outcome_idx)],
             RANGE_CONFIG: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_range_config)],
-            BUY_RANGE_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_range_1)],
             BUY_AMOUNT_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_amount_1)],
-            SELL_RANGE_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_range_1)],
             SELL_AMOUNT_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_amount_1)],
-            BUY_RANGE_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_range_2)],
             BUY_AMOUNT_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_amount_2)],
-            SELL_RANGE_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_range_2)],
             SELL_AMOUNT_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_amount_2)],
             CONFIRM_CONFIG: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_and_start)],
         },
