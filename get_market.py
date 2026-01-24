@@ -10,8 +10,6 @@ import aiohttp
 import asyncio
 from datetime import datetime, timezone, timedelta
 import time
-from collections import deque
-
 # Telegram imports
 from telegram import Update
 from telegram.ext import (
@@ -23,26 +21,18 @@ from telegram.ext import (
     ContextTypes,
 )
 from telegram.request import HTTPXRequest
-import telegram.error
 
-# Load environment variables
 load_dotenv()
 
-# Polymarket configs
+# Config
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
 
-if not PRIVATE_KEY:
-    raise ValueError("PRIVATE_KEY is missing in .env")
-if not WALLET_ADDRESS:
-    raise ValueError("WALLET_ADDRESS is missing in .env")
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("TELEGRAM_BOT_TOKEN is missing in .env")
-if not TWITTER_API_KEY:
-    raise ValueError("TWITTER_API_KEY is missing in .env")
+if not all([PRIVATE_KEY, WALLET_ADDRESS, TELEGRAM_BOT_TOKEN, TWITTER_API_KEY]):
+    raise ValueError("Missing required env variables")
 
 # Constants
 GAMMA_API = "https://gamma-api.polymarket.com"
@@ -50,7 +40,6 @@ CLOB_API = "https://clob.polymarket.com"
 POLYGON_RPC = "https://polygon-rpc.com/"
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-# Minimal ERC-1155 ABI
 ERC1155_ABI = [
     {
         "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
@@ -61,7 +50,6 @@ ERC1155_ABI = [
     }
 ]
 
-# Initialize Web3 and ClobClient
 w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
 client = ClobClient(
     host=CLOB_API,
@@ -81,40 +69,22 @@ except Exception as e:
 
 print(f"Connected to Polymarket with wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}")
 print(f"Dry run mode: {DRY_RUN}")
-print("\n⚠️ REQUIRED APPROVALS (do once):")
-print("• BUY: Approve USDC to exchange contracts")
-print("• SELL: setApprovalForAll on Conditional Tokens for exchange contracts")
-print("Exchange addrs: 0x4bFb41d5B3570DeFd03C39a9A4D8dE6Bd8B8982E & 0xd91E80cF2E7be2e162c6513ceD06f1dD0dA35296\n")
 
-# Twitter monitoring configs
+# Twitter monitoring
 TARGET_ACCOUNT = "elonmusk"
-CHECK_INTERVAL = 0.5  # Reduced to 0.5s for faster detection
-PRINT_FULL_TEXT = True
-
-# Tweet deduplication: store recent tweet IDs
-SEEN_TWEET_IDS = deque(maxlen=100)  # Keep last 100 tweet IDs to avoid reprocessing
+CHECK_INTERVAL = 0.5  # Aggressive polling for maximum speed
+LAST_CHECKED_TIME = datetime.now(timezone.utc)
+SEEN_TWEET_IDS = set()
 
 # Conversation states
-SLUG = 0
-MARKET_IDX = 1
-OUTCOME_IDX = 2
-RANGE_CONFIG = 3
-BUY_AMOUNT_1 = 4
-SELL_AMOUNT_1 = 5
-BUY_AMOUNT_2 = 6
-SELL_AMOUNT_2 = 7
-CONFIRM_CONFIG = 8
-
+SLUG, MARKET_IDX, NUM_OUTCOMES, OUTCOME1_IDX, OUTCOME2_IDX, ACTION, BUY_AMOUNT, CONFIRM_BUY, SELL_CHOICE, CUSTOM_SELL, AUTO_BUY_YN, AUTO_BUY_AMOUNT, START_MONITOR = range(13)
 
 def fetch_active_markets(slug):
-    """Fetch active markets for a given slug"""
     url = f"{GAMMA_API}/events/slug/{slug}"
     try:
-        response = requests.get(url, timeout=10)
+        response = requests.get(url)
         response.raise_for_status()
         event = response.json()
-        if not event or "markets" not in event:
-            return []
         markets = event.get("markets", [])
         active = [m for m in markets if m.get("active", False) and not m.get("closed", True)]
         return active
@@ -122,9 +92,7 @@ def fetch_active_markets(slug):
         print(f"Fetch markets error: {e}")
         return []
 
-
 def get_mid_price(token_id):
-    """Get mid price from orderbook"""
     try:
         book = client.get_order_book(token_id)
         bids = [float(p) for p, _ in book.get("bids", [])]
@@ -136,711 +104,488 @@ def get_mid_price(token_id):
         print(f"Orderbook error: {e}")
         return None
 
-
 def get_balance(token_id):
-    """Get token balance from blockchain"""
     try:
-        contract = w3.eth.contract(
-            address=w3.to_checksum_address(CONDITIONAL_TOKENS), 
-            abi=ERC1155_ABI
-        )
-        balance_wei = contract.functions.balanceOf(
-            w3.to_checksum_address(WALLET_ADDRESS), 
-            int(token_id)
-        ).call()
+        contract = w3.eth.contract(address=w3.to_checksum_address(CONDITIONAL_TOKENS), abi=ERC1155_ABI)
+        balance_wei = contract.functions.balanceOf(w3.to_checksum_address(WALLET_ADDRESS), int(token_id)).call()
         return balance_wei / 1_000_000
     except Exception as e:
         print(f"Balance fetch error: {e}")
         return 0.0
 
-
-async def place_market_order_async(token_id, amount, side):
-    """Async wrapper for placing market orders - OPTIMIZED FOR SPEED"""
+def place_market_order(token_id, amount, side):
     if DRY_RUN:
-        print(f"[DRY RUN] Would place {side} for {amount} on {token_id}")
-        return {"status": "dry_run", "success": True}
-    
+        print(f"[DRY RUN] Would place {side} amount {amount} on token {token_id}")
+        return {"status": "dry_run"}
     try:
-        # Run synchronous order creation in thread pool to avoid blocking
-        loop = asyncio.get_event_loop()
-        
-        # Create order args
         args = MarketOrderArgs(
             token_id=token_id,
             amount=amount,
             side=side,
             order_type=OrderType.FOK
         )
-        
-        # Create and post order in thread pool
-        signed = await loop.run_in_executor(None, client.create_market_order, args)
-        resp = await loop.run_in_executor(None, client.post_order, signed, OrderType.FOK)
-        
-        print(f"Order response ({side}): {resp}")
-        return {"status": "success", "response": resp, "success": True}
+        signed = client.create_market_order(args)
+        resp = client.post_order(signed, OrderType.FOK)
+        print("Order response:", resp)
+        return resp
     except Exception as e:
-        print(f"Order placement failed ({side}): {e}")
-        return {"status": "error", "error": str(e), "success": False}
+        print(f"Order placement failed: {e}")
+        return None
 
+async def safe_send_message(bot, chat_id, text):
+    try:
+        await bot.send_message(chat_id=chat_id, text=text)
+    except Exception as e:
+        print(f"Send message error: {e}")
 
-def should_execute_trade(current_price, buy_range, sell_range):
-    """
-    Determine if trade should execute based on current price and ranges
-    Returns: (should_buy, should_sell)
-    """
-    should_buy = False
-    should_sell = False
-    
-    if buy_range and len(buy_range) == 2:
-        buy_min, buy_max = buy_range
-        if buy_min <= current_price <= buy_max:
-            should_buy = True
-    
-    if sell_range and len(sell_range) == 2:
-        sell_min, sell_max = sell_range
-        if sell_min <= current_price <= sell_max:
-            should_sell = True
-    
-    return should_buy, should_sell
+async def check_for_new_tweets(session, application, initial=False):
+    global LAST_CHECKED_TIME, SEEN_TWEET_IDS
 
-
-async def execute_trades_parallel(token_id, buy_amount, sell_amount, should_buy, should_sell, chat_id, bot):
-    """
-    Execute buy and sell trades in parallel for maximum speed
-    """
-    tasks = []
-    trade_start = time.time()
-    
-    if should_buy and buy_amount > 0:
-        tasks.append(("BUY", place_market_order_async(token_id, buy_amount, BUY)))
-    
-    if should_sell and sell_amount > 0:
-        tasks.append(("SELL", place_market_order_async(token_id, sell_amount, SELL)))
-    
-    if not tasks:
-        return []
-    
-    # Execute all trades in parallel
-    results = []
-    for trade_type, task in tasks:
-        result = await task
-        results.append((trade_type, result))
-    
-    trade_end = time.time()
-    trade_duration = trade_end - trade_start
-    
-    # Send quick confirmation
-    success_trades = [t for t, r in results if r.get("success")]
-    if success_trades:
-        msg = f"⚡ {', '.join(success_trades)} executed in {trade_duration:.2f}s"
-        await safe_send_message(bot, chat_id, msg)
-    
-    return results
-
-
-async def check_for_new_tweets(session, application):
-    """
-    Optimized tweet checking with deduplication
-    """
-    # Get current timestamp for this check
     now = datetime.now(timezone.utc)
-    
-    # Look back 60 seconds to catch tweets reliably
-    since_time = now - timedelta(seconds=60)
+    overlap_back = timedelta(minutes=5) if initial else timedelta(seconds=10)
+    since_time = now - overlap_back
     until_time = now + timedelta(seconds=5)
-    
+
     since_str = since_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
     until_str = until_time.strftime("%Y-%m-%d_%H:%M:%S_UTC")
-    
+
     query = f"from:{TARGET_ACCOUNT} since:{since_str} until:{until_str} include:nativeretweets"
     url = "https://api.twitterapi.io/twitter/tweet/advanced_search"
     params = {"query": query, "queryType": "Latest"}
     headers = {"X-API-Key": TWITTER_API_KEY}
-    
+
     all_tweets = []
     next_cursor = None
     detection_start = time.time()
-    
-    # Fetch all tweets with pagination
+
     while True:
         if next_cursor:
             params["cursor"] = next_cursor
-        
-        try:
-            async with session.get(url, headers=headers, params=params, timeout=10) as response:
-                if response.status == 200:
-                    data = await response.json()
-                    tweets = data.get("tweets", [])
-                    all_tweets.extend(tweets)
-                    
-                    if data.get("has_next_page", False) and data.get("next_cursor"):
-                        next_cursor = data.get("next_cursor")
-                    else:
-                        break
-                else:
-                    print(f"Twitter API Error: {response.status}")
-                    break
-        except Exception as e:
-            print(f"Tweet fetch error: {e}")
-            break
-    
-    # Filter out already seen tweets using tweet ID
-    new_tweets = []
-    for tweet in all_tweets:
-        tweet_id = tweet.get('id') or tweet.get('tweetId') or tweet.get('tweet_id')
-        if tweet_id and tweet_id not in SEEN_TWEET_IDS:
-            new_tweets.append(tweet)
-            SEEN_TWEET_IDS.append(tweet_id)
-    
-    if new_tweets:
-        detection_end = time.time()
-        print(f"DETECTION: Found {len(new_tweets)} NEW tweets in {detection_end - detection_start:.3f}s")
-        
-        chat_id = application.bot_data.get('chat_id')
-        token_id = application.bot_data.get('token_id')
-        
-        # Get current price for display
-        current_price = get_mid_price(token_id)
-        price_str = f"{current_price:.4f}" if current_price else "N/A"
-        
-        # Get configured amounts from both ranges
-        range_1 = application.bot_data.get('range_1', {})
-        range_2 = application.bot_data.get('range_2', {})
-        
-        buy_amount_1 = range_1.get('buy_amount', 0)
-        buy_amount_2 = range_2.get('buy_amount', 0)
-        sell_amount_1 = range_1.get('sell_amount', 0)
-        sell_amount_2 = range_2.get('sell_amount', 0)
-        
-        # Calculate total amounts to trade (execute ALL configured trades)
-        total_buy = buy_amount_1 + buy_amount_2
-        total_sell = sell_amount_1 + sell_amount_2
-        
-        should_buy = total_buy > 0
-        should_sell = total_sell > 0
-        
-        # Execute trades in parallel at MARKET PRICE
-        if should_buy or should_sell:
-            await execute_trades_parallel(
-                token_id,
-                total_buy,
-                total_sell,
-                should_buy,
-                should_sell,
-                chat_id,
-                application.bot
-            )
-            
-            # Show execution summary
-            summary = f"📊 Executed at market price ~{price_str}\n"
-            if should_buy:
-                summary += f"✅ BUY: ${total_buy:.2f} USDC\n"
-            if should_sell:
-                summary += f"✅ SELL: {total_sell:.2f} shares\n"
-            await safe_send_message(application.bot, chat_id, summary)
-        else:
-            await safe_send_message(
-                application.bot,
-                chat_id,
-                f"📊 Tweet detected but no trades configured (price: {price_str})"
-            )
-        
-        # Send tweet notification
-        message = f"{'═' * 60}\n🆕 {len(new_tweets)} NEW TWEET(S) FROM @{TARGET_ACCOUNT}\n{'═' * 60}\n\n"
-        
-        for tweet in new_tweets:
-            created_str = tweet.get('createdAt', '??')
-            try:
-                tweet_time = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
-                latency = (now - tweet_time).total_seconds()
-                latency_str = f"{latency:.2f}s ago"
-                time_str = tweet_time.strftime('%Y-%m-%d %H:%M:%S UTC')
-            except:
-                latency_str = "??"
-                time_str = "??"
-            
-            message += f"[{time_str}] ({latency_str})\n"
-            
-            text = tweet.get('text', '').strip()
-            if PRINT_FULL_TEXT:
-                message += f"{text}\n"
-            else:
-                preview = text[:90] + "…" if len(text) > 90 else text
-                message += f"{preview}\n"
-            
-            message += "─" * 60 + "\n"
-        
-        await safe_send_message(application.bot, chat_id, message)
-        
-        # Final timing
-        total_cycle = time.time() - detection_start
-        print(f"TOTAL CYCLE TIME: {total_cycle:.3f}s")
+        async with session.get(url, headers=headers, params=params) as response:
+            if response.status != 200:
+                print(f"Twitter API Error: {response.status}")
+                break
+            data = await response.json()
+            tweets = data.get("tweets", [])
+            all_tweets.extend(tweets)
+            if not data.get("has_next_page", False) or not data.get("next_cursor"):
+                break
+            next_cursor = data.get("next_cursor")
 
+    if initial:
+        for tweet in all_tweets:
+            SEEN_TWEET_IDS.add(tweet.get("id"))
+        LAST_CHECKED_TIME = now
+        print(f"Initial population complete: {len(SEEN_TWEET_IDS)} recent tweets cached")
+        return
 
-async def safe_send_message(bot, chat_id, text):
-    """Send message with retry logic"""
-    try:
-        await bot.send_message(chat_id=chat_id, text=text)
-    except telegram.error.TimedOut:
-        print("Timeout on send_message - retrying once...")
-        await asyncio.sleep(2)
+    new_tweets = [t for t in all_tweets if t.get("id") not in SEEN_TWEET_IDS]
+    if not new_tweets:
+        return
+
+    detection_end = time.time()
+    print(f"DETECTION TOOK {detection_end - detection_start:.3f}s")
+
+    chat_id = application.bot_data['chat_id']
+
+    # Retrieve trigger config
+    token_id_sell = application.bot_data.get('token_id_sell')
+    sell_amount = application.bot_data.get('sell_amount', 0)
+    token_id_buy = application.bot_data.get('token_id_buy')
+    buy_usdc = application.bot_data.get('buy_usdc', 0)
+    from_outcome = application.bot_data.get('from_outcome')
+    target_outcome = application.bot_data.get('target_outcome')
+
+    trigger_msg = "🚨 NEW ELON ACTIVITY DETECTED! Executing trigger actions...\n\n"
+    results = []
+
+    # Execute SELL first (priority for better fill in fast-moving markets)
+    sell_result = None
+    if sell_amount > 0 and token_id_sell:
+        sell_start = time.time()
+        sell_result = place_market_order(token_id_sell, sell_amount, SELL)
+        sell_dur = time.time() - sell_start
+        results.append(f"✅ SELL {sell_amount:.4f} shares of {from_outcome} (took {sell_dur:.3f}s)")
+        print(f"SELL executed in {sell_dur:.3f}s")
+
+    # Then BUY
+    buy_result = None
+    if buy_usdc > 0 and token_id_buy:
+        buy_start = time.time()
+        buy_result = place_market_order(token_id_buy, buy_usdc, BUY)
+        buy_dur = time.time() - buy_start
+        results.append(f"✅ BUY ${buy_usdc:.2f} USDC of {target_outcome} (took {buy_dur:.3f}s)")
+        print(f"BUY executed in {buy_dur:.3f}s")
+
+    if results:
+        trigger_msg += "\n".join(results)
+    else:
+        trigger_msg += "No actions configured."
+
+    await safe_send_message(application.bot, chat_id, trigger_msg)
+
+    # Full tweet details
+    message = f"{'═' * 60}\nDETECTED {len(new_tweets)} NEW TWEET(S)\n{'═' * 60}\n\n"
+    for tweet in new_tweets:
+        created_str = tweet.get('createdAt', '??')
         try:
-            await bot.send_message(chat_id=chat_id, text=text)
+            tweet_time = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+            latency = (now - tweet_time).total_seconds()
+            latency_str = f"{latency:.2f}s ago"
+            time_str = tweet_time.strftime('%Y-%m-%d %H:%M:%S UTC')
         except:
-            print("Failed to send message after retry")
-    except Exception as e:
-        print(f"Send message error: {e}")
+            latency_str = "??"
+            time_str = "??"
+        message += f"[{time_str}] {latency_str}\n"
+        text = tweet.get('text', '').strip()
+        message += f"{text[:500]}{'...' if len(text) > 500 else ''}\n"
+        message += "─" * 70 + "\n"
 
+    await safe_send_message(application.bot, chat_id, message)
+
+    total_cycle = time.time() - detection_start
+    print(f"FULL CYCLE (detect → orders): {total_cycle:.3f}s")
+    await safe_send_message(application.bot, chat_id, f"Full cycle completed in {total_cycle:.2f}s")
+
+    # Update seen + last checked time
+    tweet_times = []
+    for tweet in new_tweets:
+        tid = tweet.get("id")
+        if tid:
+            SEEN_TWEET_IDS.add(tid)
+        created_str = tweet.get('createdAt')
+        if created_str:
+            try:
+                tt = datetime.strptime(created_str, "%a %b %d %H:%M:%S %z %Y")
+                tweet_times.append(tt)
+            except:
+                pass
+
+    if tweet_times:
+        LAST_CHECKED_TIME = max(tweet_times) + timedelta(seconds=1)
 
 async def monitor_elon_activity(application: Application):
-    """Main monitoring loop"""
-    print("🔍 Monitoring loop started")
-    
-    # Use longer timeout for persistent connection
-    timeout = aiohttp.ClientTimeout(total=30, connect=10, sock_read=20)
-    
-    async with aiohttp.ClientSession(timeout=timeout) as session:
+    print("Monitoring started")
+    async with aiohttp.ClientSession() as session:
+        # Initial population to avoid triggering on past tweets
+        await check_for_new_tweets(session, application, initial=True)
         while application.bot_data.get('monitoring', False):
-            try:
-                start_time = time.time()
-                await check_for_new_tweets(session, application)
-                duration = time.time() - start_time
-                
-                # Dynamic sleep to maintain check interval
-                sleep_time = max(0, CHECK_INTERVAL - duration)
-                await asyncio.sleep(sleep_time)
-            except Exception as e:
-                print(f"Monitor loop error: {e}")
-                await asyncio.sleep(CHECK_INTERVAL)
-    
-    print("🛑 Monitoring loop ended")
+            loop_start = time.time()
+            await check_for_new_tweets(session, application)
+            duration = time.time() - loop_start
+            print(f"Poll cycle: {duration:.3f}s", end="\r", flush=True)
+            sleep_time = max(0, CHECK_INTERVAL - duration)
+            await asyncio.sleep(sleep_time)
+    print("Monitoring stopped")
 
-
-# ═══════════════════════════════════════════════════════════════
-# TELEGRAM CONVERSATION HANDLERS
-# ═══════════════════════════════════════════════════════════════
-
+# Telegram handlers
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Start configuration"""
-    context.user_data.clear()
-    await update.message.reply_text(
-        "🚀 Welcome to Polymarket Tweet Trading Bot!\n\n"
-        "Enter Polymarket event slug:\n"
-        "(e.g., elon-musk-of-tweets-january-16-january-23)"
-    )
+    await update.message.reply_text("Enter Polymarket event slug:")
     return SLUG
 
-
 async def get_slug(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get and validate slug"""
     slug = update.message.text.strip()
     context.user_data['slug'] = slug
-    
     markets = fetch_active_markets(slug)
     if not markets:
-        await update.message.reply_text(
-            "❌ No active markets found.\n"
-            "Check the slug or try /start again."
-        )
+        await update.message.reply_text("No active markets found.")
         return ConversationHandler.END
-    
-    context.user_data['markets'] = markets
-    
-    text = f"✅ Found {len(markets)} active market(s):\n\n"
+    text = f"Found {len(markets)} active market(s):\n"
     for i, m in enumerate(markets):
         text += f"{i}: {m.get('question', 'Unknown')}\n"
-    
     await update.message.reply_text(text + "\nSelect market number:")
     return MARKET_IDX
 
-
 async def get_market_idx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Select market"""
     try:
         idx = int(update.message.text.strip())
-        markets = context.user_data['markets']
-        
-        if idx < 0 or idx >= len(markets):
-            raise ValueError
-        
+        markets = fetch_active_markets(context.user_data['slug'])
         market = markets[idx]
         context.user_data['market'] = market
-        
         outcomes = market.get("outcomes", [])
         if isinstance(outcomes, str):
             outcomes = json.loads(outcomes)
-        
         token_ids = market.get("clobTokenIds", [])
         if isinstance(token_ids, str):
             token_ids = json.loads(token_ids)
-        
         context.user_data['outcomes'] = outcomes
         context.user_data['token_ids'] = token_ids
-        
-        text = "📊 Outcomes:\n\n"
-        for i, outcome in enumerate(outcomes):
-            text += f"{i}: {outcome}\n"
-        
-        await update.message.reply_text(text + "\nSelect outcome index:")
-        return OUTCOME_IDX
+        await update.message.reply_text("How many outcome ranges do you want to trade on? (1 or 2)")
+        return NUM_OUTCOMES
     except:
-        await update.message.reply_text("❌ Invalid number. Try again:")
+        await update.message.reply_text("Invalid number.")
         return MARKET_IDX
 
+async def get_num_outcomes(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    text = update.message.text.strip()
+    if text not in ["1", "2"]:
+        await update.message.reply_text("Please enter 1 or 2")
+        return NUM_OUTCOMES
+    context.user_data['num_outcomes'] = int(text)
+    await update.message.reply_text("Select FIRST outcome (current / from range):")
+    return OUTCOME1_IDX
 
-async def get_outcome_idx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Select outcome"""
+async def get_outcome1_idx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         idx = int(update.message.text.strip())
         outcomes = context.user_data['outcomes']
-        
-        if idx < 0 or idx >= len(outcomes):
-            raise ValueError
-        
         token_ids = context.user_data['token_ids']
+        outcome = outcomes[idx]
         token_id = token_ids[idx]
-        selected = outcomes[idx]
-        
-        context.user_data['token_id'] = token_id
-        context.user_data['selected'] = selected
-        
-        mid = get_mid_price(token_id)
-        price_str = f"{mid:.4f} USDC" if mid else "unavailable"
-        
+        context.user_data['outcome1'] = outcome
+        context.user_data['token_id1'] = token_id
+
+        if context.user_data['num_outcomes'] == 1:
+            mid = get_mid_price(token_id)
+            price_str = f"{mid:.4f}" if mid else "N/A"
+            await update.message.reply_text(
+                f"Selected: {outcome} | Mid: {price_str}\n\n"
+                "Initial action on this outcome — Buy new position or use existing for Sell? (b/s)"
+            )
+            return ACTION
+        else:
+            text = "Remaining outcomes:\n"
+            for i, o in enumerate(outcomes):
+                if i != idx:
+                    text += f"{i}: {o}\n"
+            await update.message.reply_text(text + "\nSelect SECOND outcome (target / to range):")
+            return OUTCOME2_IDX
+    except:
+        await update.message.reply_text("Invalid index.")
+        return OUTCOME1_IDX
+
+async def get_outcome2_idx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        idx = int(update.message.text.strip())
+        outcomes = context.user_data['outcomes']
+        token_ids = context.user_data['token_ids']
+        outcome = outcomes[idx]
+        token_id = token_ids[idx]
+        context.user_data['outcome2'] = outcome
+        context.user_data['token_id2'] = token_id
+
+        mid1 = get_mid_price(context.user_data['token_id1'])
+        mid2 = get_mid_price(token_id)
         await update.message.reply_text(
-            f"✅ Selected: {selected}\n"
-            f"💰 Current mid price: {price_str}\n\n"
-            f"How many trading ranges do you want?\n"
-            f"1 = Single range\n"
-            f"2 = Two ranges\n"
-            f"Enter choice:"
+            f"From: {context.user_data['outcome1']} (mid {mid1:.4f if mid1 else 'N/A'})\n"
+            f"To: {outcome} (mid {mid2:.4f if mid2 else 'N/A'})\n\n"
+            "Initial action on FROM outcome — Buy or use existing Sell? (b/s)"
         )
-        return RANGE_CONFIG
+        return ACTION
     except:
-        await update.message.reply_text("❌ Invalid index. Try again:")
-        return OUTCOME_IDX
+        await update.message.reply_text("Invalid index.")
+        return OUTCOME2_IDX
 
+async def get_action(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    action = update.message.text.lower().strip()
+    if action not in ['b', 's']:
+        await update.message.reply_text("Please enter 'b' or 's'")
+        return ACTION
+    context.user_data['action'] = action
+    token_id1 = context.user_data['token_id1']
 
-async def get_range_config(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Configure number of ranges"""
-    choice = update.message.text.strip()
-    
-    if choice not in ['1', '2']:
-        await update.message.reply_text("❌ Enter '1' or '2':")
-        return RANGE_CONFIG
-    
-    context.user_data['num_ranges'] = int(choice)
-    
-    await update.message.reply_text(
-        "📈 RANGE 1 - BUY CONFIGURATION\n\n"
-        "Enter USDC amount to BUY when tweet detected\n"
-        "(or enter 0 to skip buying):\n"
-        "Example: 50"
-    )
-    return BUY_AMOUNT_1
-
-
-async def get_buy_amount_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get buy amount for range 1"""
-    try:
-        amount = float(update.message.text.strip())
-        if amount < 0:
-            raise ValueError
-        
-        context.user_data['range_1_buy_amount'] = amount
-        
-        if amount > 0:
-            await update.message.reply_text(
-                f"✅ Will BUY ${amount:.2f} USDC at market price\n\n"
-                f"📉 RANGE 1 - SELL CONFIGURATION\n\n"
-                f"Enter number of shares to SELL when tweet detected\n"
-                f"(or enter 0 to skip selling):"
-            )
-        else:
-            await update.message.reply_text(
-                f"⏭️ Buy disabled for Range 1\n\n"
-                f"📉 RANGE 1 - SELL CONFIGURATION\n\n"
-                f"Enter number of shares to SELL when tweet detected\n"
-                f"(or enter 0 to skip selling):"
-            )
-        return SELL_AMOUNT_1
-    except:
-        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
-        return BUY_AMOUNT_1
-
-
-async def get_sell_amount_1(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get sell amount for range 1"""
-    try:
-        amount = float(update.message.text.strip())
-        if amount < 0:
-            raise ValueError
-        
-        context.user_data['range_1_sell_amount'] = amount
-        
-        # Check if we need range 2
-        if context.user_data.get('num_ranges') == 2:
-            if amount > 0:
-                await update.message.reply_text(
-                    f"✅ Will SELL {amount:.2f} shares at market price\n\n"
-                    f"📈 RANGE 2 - BUY CONFIGURATION\n\n"
-                    f"Enter USDC amount to BUY when tweet detected\n"
-                    f"(or enter 0 to skip):"
-                )
-            else:
-                await update.message.reply_text(
-                    f"⏭️ Sell disabled for Range 1\n\n"
-                    f"📈 RANGE 2 - BUY CONFIGURATION\n\n"
-                    f"Enter USDC amount to BUY when tweet detected\n"
-                    f"(or enter 0 to skip):"
-                )
-            return BUY_AMOUNT_2
-        else:
-            # Show summary and confirm
-            return await show_confirmation(update, context)
-    except:
-        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
-        return SELL_AMOUNT_1
-
-
-async def get_buy_amount_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get buy amount for range 2"""
-    try:
-        amount = float(update.message.text.strip())
-        if amount < 0:
-            raise ValueError
-        
-        context.user_data['range_2_buy_amount'] = amount
-        
-        if amount > 0:
-            await update.message.reply_text(
-                f"✅ Will BUY ${amount:.2f} USDC at market price\n\n"
-                f"📉 RANGE 2 - SELL CONFIGURATION\n\n"
-                f"Enter number of shares to SELL when tweet detected\n"
-                f"(or enter 0 to skip):"
-            )
-        else:
-            await update.message.reply_text(
-                f"⏭️ Buy disabled for Range 2\n\n"
-                f"📉 RANGE 2 - SELL CONFIGURATION\n\n"
-                f"Enter number of shares to SELL when tweet detected\n"
-                f"(or enter 0 to skip):"
-            )
-        return SELL_AMOUNT_2
-    except:
-        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
-        return BUY_AMOUNT_2
-
-
-async def get_sell_amount_2(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Get sell amount for range 2"""
-    try:
-        amount = float(update.message.text.strip())
-        if amount < 0:
-            raise ValueError
-        
-        context.user_data['range_2_sell_amount'] = amount
-        
-        return await show_confirmation(update, context)
-    except:
-        await update.message.reply_text("❌ Invalid amount. Enter a number (or 0 to skip):")
-        return SELL_AMOUNT_2
-
-
-async def show_confirmation(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Show configuration summary and ask for confirmation"""
-    summary = "═" * 50 + "\n"
-    summary += "📋 CONFIGURATION SUMMARY\n"
-    summary += "═" * 50 + "\n\n"
-    
-    summary += f"🎯 Outcome: {context.user_data['selected']}\n"
-    summary += f"🔢 Token ID: {context.user_data['token_id']}\n\n"
-    
-    summary += "⚡ ON EVERY TWEET DETECTION:\n\n"
-    
-    # Range 1
-    summary += "📊 RANGE 1:\n"
-    buy_amt_1 = context.user_data.get('range_1_buy_amount', 0)
-    sell_amt_1 = context.user_data.get('range_1_sell_amount', 0)
-    
-    if buy_amt_1 > 0:
-        summary += f"  📈 BUY ${buy_amt_1:.2f} USDC at market price\n"
+    if action == 'b':
+        await update.message.reply_text("Enter initial USDC amount to BUY on FROM outcome:")
+        return BUY_AMOUNT
     else:
-        summary += f"  📈 BUY: Disabled\n"
-    
-    if sell_amt_1 > 0:
-        summary += f"  📉 SELL {sell_amt_1:.2f} shares at market price\n"
-    else:
-        summary += f"  📉 SELL: Disabled\n"
-    
-    # Range 2 if configured
-    if context.user_data.get('num_ranges') == 2:
-        summary += "\n📊 RANGE 2:\n"
-        buy_amt_2 = context.user_data.get('range_2_buy_amount', 0)
-        sell_amt_2 = context.user_data.get('range_2_sell_amount', 0)
-        
-        if buy_amt_2 > 0:
-            summary += f"  📈 BUY ${buy_amt_2:.2f} USDC at market price\n"
-        else:
-            summary += f"  📈 BUY: Disabled\n"
-        
-        if sell_amt_2 > 0:
-            summary += f"  📉 SELL {sell_amt_2:.2f} shares at market price\n"
-        else:
-            summary += f"  📉 SELL: Disabled\n"
-    
-    # Calculate totals
-    total_buy = buy_amt_1 + context.user_data.get('range_2_buy_amount', 0)
-    total_sell = sell_amt_1 + context.user_data.get('range_2_sell_amount', 0)
-    
-    summary += "\n" + "─" * 50 + "\n"
-    summary += "💰 TOTAL PER TWEET:\n"
-    if total_buy > 0:
-        summary += f"  BUY: ${total_buy:.2f} USDC\n"
-    if total_sell > 0:
-        summary += f"  SELL: {total_sell:.2f} shares\n"
-    if total_buy == 0 and total_sell == 0:
-        summary += "  ⚠️ No trades configured!\n"
-    
-    summary += "\n" + "═" * 50 + "\n"
-    summary += "Start monitoring? (y/n)"
-    
-    await update.message.reply_text(summary)
-    return CONFIRM_CONFIG
+        bal = get_balance(token_id1)
+        if bal < 0.01:
+            await update.message.reply_text("Insufficient balance on FROM outcome.")
+            return ConversationHandler.END
+        context.user_data['balance'] = bal
+        await update.message.reply_text(
+            f"Balance on FROM: {bal:.4f} shares\n\n"
+            "Sell amount on trigger:\n1 = 25%\n2 = 50%\n3 = 100%\n4 = custom\nChoice:"
+        )
+        return SELL_CHOICE
 
+async def get_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        usdc = float(update.message.text.strip())
+        if usdc <= 0:
+            raise ValueError
+        context.user_data['initial_usdc'] = usdc
+        token_id = context.user_data['token_id1']
+        mid = get_mid_price(token_id)
+        est = usdc / mid if mid and mid > 0 else "?"
+        await update.message.reply_text(f"Estimated ≈ {est} shares\n\nConfirm initial BUY? (y/n)")
+        return CONFIRM_BUY
+    except:
+        await update.message.reply_text("Invalid amount.")
+        return BUY_AMOUNT
 
-async def confirm_and_start(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Confirm configuration and start monitoring"""
+async def confirm_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     if 'y' not in update.message.text.lower():
-        await update.message.reply_text("❌ Configuration cancelled.")
+        await update.message.reply_text("Cancelled.")
         return ConversationHandler.END
-    
-    # Store configuration in bot_data
-    context.bot_data['token_id'] = context.user_data['token_id']
-    context.bot_data['chat_id'] = update.effective_chat.id
-    
-    # Build range configurations (simplified - just amounts)
-    range_1 = {
-        'buy_amount': context.user_data.get('range_1_buy_amount', 0),
-        'sell_amount': context.user_data.get('range_1_sell_amount', 0)
-    }
-    
-    range_2 = {
-        'buy_amount': context.user_data.get('range_2_buy_amount', 0),
-        'sell_amount': context.user_data.get('range_2_sell_amount', 0)
-    }
-    
-    context.bot_data['range_1'] = range_1
-    context.bot_data['range_2'] = range_2
-    context.bot_data['monitoring'] = True
-    
-    # Clear seen tweets to start fresh
-    SEEN_TWEET_IDS.clear()
-    
-    # Start monitoring task
-    context.application.create_task(monitor_elon_activity(context.application))
-    
-    await update.message.reply_text(
-        "✅ Monitoring started!\n\n"
-        f"🔍 Watching @{TARGET_ACCOUNT}\n"
-        f"⚡ Check interval: {CHECK_INTERVAL}s\n"
-        f"📊 Ranges configured: {context.user_data.get('num_ranges')}\n"
-        f"💰 Trades execute at MARKET PRICE\n\n"
-        "Use /stop to stop monitoring\n"
-        "Use /status to check status"
-    )
-    
-    return ConversationHandler.END
 
+    token_id = context.user_data['token_id1']
+    usdc = context.user_data['initial_usdc']
+    place_market_order(token_id, usdc, BUY)
+    bal = get_balance(token_id)
+    context.user_data['balance'] = bal
+
+    await update.message.reply_text(
+        f"Initial BUY completed. New balance: {bal:.4f} shares\n\n"
+        "Now set SELL amount on trigger for FROM outcome:\n"
+        "1 = 25%\n2 = 50%\n3 = 100%\n4 = custom\nChoice:"
+    )
+    return SELL_CHOICE
+
+async def get_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ch = update.message.text.strip()
+    bal = context.user_data['balance']
+    if ch == '4':
+        await update.message.reply_text("Enter custom shares to sell on trigger:")
+        return CUSTOM_SELL
+    elif ch in ['1', '2', '3']:
+        percs = {'1': 0.25, '2': 0.5, '3': 1.0}
+        sell_amount = bal * percs[ch]
+        context.user_data['sell_amount'] = sell_amount
+        mid = get_mid_price(context.user_data['token_id1'])
+        est = sell_amount * mid if mid else "?"
+        await update.message.reply_text(
+            f"Will SELL {sell_amount:.4f} shares on trigger (≈ ${est} USDC)\n\n"
+            "Also perform AUTO BUY on trigger? (y/n)"
+        )
+        return AUTO_BUY_YN
+    else:
+        await update.message.reply_text("Invalid choice.")
+        return SELL_CHOICE
+
+async def get_custom_sell(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        shares = float(update.message.text.strip())
+        bal = context.user_data['balance']
+        if shares <= 0 or shares > bal:
+            raise ValueError
+        context.user_data['sell_amount'] = shares
+        mid = get_mid_price(context.user_data['token_id1'])
+        est = shares * mid if mid else "?"
+        await update.message.reply_text(
+            f"Will SELL {shares:.4f} shares on trigger (≈ ${est} USDC)\n\n"
+            "Also perform AUTO BUY on trigger? (y/n)"
+        )
+        return AUTO_BUY_YN
+    except:
+        await update.message.reply_text("Invalid amount.")
+        return CUSTOM_SELL
+
+async def get_auto_buy_yn(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if 'y' in update.message.text.lower():
+        target = context.user_data.get('outcome2') or context.user_data['outcome1']
+        await update.message.reply_text(f"Enter USDC amount to BUY on trigger (to {target}):")
+        return AUTO_BUY_AMOUNT
+    else:
+        context.user_data['buy_usdc'] = 0
+        await update.message.reply_text(await build_confirm_message(update, context))
+        return START_MONITOR
+
+async def get_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        amount = float(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+        context.user_data['buy_usdc'] = amount
+        await update.message.reply_text(await build_confirm_message(update, context))
+        return START_MONITOR
+    except:
+        await update.message.reply_text("Invalid amount.")
+        return AUTO_BUY_AMOUNT
+
+async def build_confirm_message(update: Update, context: ContextTypes.DEFAULT_TYPE) -> str:
+    from_o = context.user_data['outcome1']
+    target_o = context.user_data.get('outcome2') or from_o
+    sell_amt = context.user_data.get('sell_amount', 0)
+    buy_usdc = context.user_data.get('buy_usdc', 0)
+
+    msg = "On new Elon tweet:\n"
+    if sell_amt > 0:
+        mid_sell = get_mid_price(context.user_data['token_id1'])
+        est_sell = sell_amt * mid_sell if mid_sell else "?"
+        msg += f"• SELL {sell_amt:.4f} shares of {from_o} (≈ ${est_sell})\n"
+    if buy_usdc > 0:
+        target_token = context.user_data.get('token_id2') or context.user_data['token_id1']
+        mid_buy = get_mid_price(target_token)
+        est_shares = buy_usdc / mid_buy if mid_buy and mid_buy > 0 else "?"
+        msg += f"• BUY ${buy_usdc:.2f} USDC of {target_o} (≈ {est_shares} shares)\n"
+    if sell_amt == 0 and buy_usdc == 0:
+        msg += "• No actions configured\n"
+
+    msg += "\nStart monitoring? (y/n)"
+    return msg
+
+async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    if 'y' not in update.message.text.lower():
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
+
+    context.bot_data['token_id_sell'] = context.user_data['token_id1']
+    context.bot_data['sell_amount'] = context.user_data.get('sell_amount', 0)
+    context.bot_data['token_id_buy'] = context.user_data.get('token_id2') or (
+        context.user_data['token_id1'] if context.user_data.get('buy_usdc', 0) > 0 else None
+    )
+    context.bot_data['buy_usdc'] = context.user_data.get('buy_usdc', 0)
+    context.bot_data['from_outcome'] = context.user_data['outcome1']
+    context.bot_data['target_outcome'] = context.user_data.get('outcome2') or context.user_data['outcome1']
+    context.bot_data['chat_id'] = update.effective_chat.id
+    context.bot_data['monitoring'] = True
+
+    context.application.create_task(monitor_elon_activity(context.application))
+    await update.message.reply_text("🚀 Monitoring started! Will act instantly on new Elon activity.")
+    return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    """Cancel configuration"""
-    await update.message.reply_text("❌ Configuration cancelled.")
+    await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
 
-
 async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Stop monitoring"""
     context.bot_data['monitoring'] = False
-    await update.message.reply_text("🛑 Monitoring stopped.")
-
+    await update.message.reply_text("Monitoring stopped.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE) -> None:
-    """Show monitoring status"""
     if context.bot_data.get('monitoring', False):
-        token_id = context.bot_data.get('token_id', 'N/A')
-        current_price = get_mid_price(token_id) if token_id != 'N/A' else None
-        
-        msg = f"✅ Monitoring is ACTIVE\n\n"
-        msg += f"🎯 Token ID: {token_id}\n"
-        if current_price:
-            msg += f"💰 Current Price: {current_price:.4f}\n"
-        msg += f"👀 Watching: @{TARGET_ACCOUNT}\n"
-        msg += f"⏱️ Seen tweets: {len(SEEN_TWEET_IDS)}\n"
-        
-        await update.message.reply_text(msg)
+        await update.message.reply_text("Monitoring active.")
     else:
-        await update.message.reply_text("⭕ Not monitoring. Use /start to begin.")
-
-
-# ═══════════════════════════════════════════════════════════════
-# MAIN
-# ═══════════════════════════════════════════════════════════════
+        await update.message.reply_text("Not monitoring.")
 
 def main():
-    """Main entry point"""
-    # Custom request with increased timeouts
     custom_request = HTTPXRequest(
         connection_pool_size=20,
         read_timeout=30,
-        write_timeout=30,
-        connect_timeout=15,
+        connect_timeout=30,
         pool_timeout=30,
-        media_write_timeout=60
     )
-    
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).request(custom_request).build()
-    
-    # Conversation handler with all states
+
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
             SLUG: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_slug)],
             MARKET_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_market_idx)],
-            OUTCOME_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_outcome_idx)],
-            RANGE_CONFIG: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_range_config)],
-            BUY_AMOUNT_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_amount_1)],
-            SELL_AMOUNT_1: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_amount_1)],
-            BUY_AMOUNT_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_amount_2)],
-            SELL_AMOUNT_2: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_amount_2)],
-            CONFIRM_CONFIG: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_and_start)],
+            NUM_OUTCOMES: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_num_outcomes)],
+            OUTCOME1_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_outcome1_idx)],
+            OUTCOME2_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_outcome2_idx)],
+            ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_action)],
+            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_buy_amount)],
+            CONFIRM_BUY: [MessageHandler(filters.TEXT & ~filters.COMMAND, confirm_buy)],
+            SELL_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_choice)],
+            CUSTOM_SELL: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_custom_sell)],
+            AUTO_BUY_YN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_auto_buy_yn)],
+            AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_auto_buy_amount)],
+            START_MONITOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_monitor)],
         },
         fallbacks=[CommandHandler("cancel", cancel)],
         allow_reentry=True,
     )
-    
+
     application.add_handler(conv_handler)
     application.add_handler(CommandHandler("stop", stop_monitor))
     application.add_handler(CommandHandler("status", status))
-    
-    print("=" * 60)
-    print("🤖 TELEGRAM BOT STARTED")
-    print("=" * 60)
-    print(f"⚠️  DRY RUN MODE: {DRY_RUN}")
-    print(f"📊 Target Account: @{TARGET_ACCOUNT}")
-    print(f"⏱️  Check Interval: {CHECK_INTERVAL}s")
-    print("=" * 60)
-    print("\nUse /start in your Telegram chat to begin configuration")
-    print("=" * 60)
-    
+
+    print("Bot running. Use /start")
     application.run_polling(allowed_updates=Update.ALL_TYPES)
 
-
 if __name__ == "__main__":
-    if not DRY_RUN:
-        print("\n" + "!" * 60)
-        print("⚠️  WARNING: REAL MONEY TRADING ENABLED!")
-        print("!" * 60)
-        print("Set DRY_RUN=true in .env for testing\n")
-    
+    print("⚠️ REAL TRADING — KEEP DRY_RUN=true UNTIL FULLY TESTED!")
     main()
