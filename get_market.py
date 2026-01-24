@@ -300,53 +300,27 @@ async def check_for_new_tweets(session, application):
         chat_id = application.bot_data.get('chat_id')
         token_id = application.bot_data.get('token_id')
         
-        # Get current price
+        # Get current price for display
         current_price = get_mid_price(token_id)
+        price_str = f"{current_price:.4f}" if current_price else "N/A"
         
-        if current_price is None:
-            await safe_send_message(application.bot, chat_id, "⚠️ Could not fetch current price!")
-            return
-        
-        # Check both range configurations
+        # Get configured amounts from both ranges
         range_1 = application.bot_data.get('range_1', {})
         range_2 = application.bot_data.get('range_2', {})
         
-        should_buy_1, should_sell_1 = should_execute_trade(
-            current_price,
-            range_1.get('buy_range'),
-            range_1.get('sell_range')
-        )
-        
-        should_buy_2, should_sell_2 = should_execute_trade(
-            current_price,
-            range_2.get('buy_range'),
-            range_2.get('sell_range')
-        )
-        
-        # Combine decisions (execute if either range triggers)
-        should_buy = should_buy_1 or should_buy_2
-        should_sell = should_sell_1 or should_sell_2
-        
-        # Get amounts
         buy_amount_1 = range_1.get('buy_amount', 0)
         buy_amount_2 = range_2.get('buy_amount', 0)
         sell_amount_1 = range_1.get('sell_amount', 0)
         sell_amount_2 = range_2.get('sell_amount', 0)
         
-        # Calculate total amounts
-        total_buy = 0
-        total_sell = 0
+        # Calculate total amounts to trade (execute ALL configured trades)
+        total_buy = buy_amount_1 + buy_amount_2
+        total_sell = sell_amount_1 + sell_amount_2
         
-        if should_buy_1:
-            total_buy += buy_amount_1
-        if should_buy_2:
-            total_buy += buy_amount_2
-        if should_sell_1:
-            total_sell += sell_amount_1
-        if should_sell_2:
-            total_sell += sell_amount_2
+        should_buy = total_buy > 0
+        should_sell = total_sell > 0
         
-        # Execute trades in parallel
+        # Execute trades in parallel at MARKET PRICE
         if should_buy or should_sell:
             await execute_trades_parallel(
                 token_id,
@@ -357,11 +331,19 @@ async def check_for_new_tweets(session, application):
                 chat_id,
                 application.bot
             )
+            
+            # Show execution summary
+            summary = f"📊 Executed at market price ~{price_str}\n"
+            if should_buy:
+                summary += f"✅ BUY: ${total_buy:.2f} USDC\n"
+            if should_sell:
+                summary += f"✅ SELL: {total_sell:.2f} shares\n"
+            await safe_send_message(application.bot, chat_id, summary)
         else:
             await safe_send_message(
                 application.bot,
                 chat_id,
-                f"📊 Current price {current_price:.4f} - No range match (no trade)"
+                f"📊 Tweet detected but no trades configured (price: {price_str})"
             )
         
         # Send tweet notification
