@@ -3,7 +3,7 @@ import json
 import time
 import asyncio
 import aiohttp
-from datetime import datetime, timezone, timedelta
+from datetime import datetime, timezone
 
 import requests
 from dotenv import load_dotenv
@@ -40,9 +40,9 @@ CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87
 # Provide comma-separated YouTube API keys in env: YOUTUBE_API_KEYS="key1,key2,..."
 YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
 YT_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCX6OQ3DkcsbYNE6H8uQQuVA")  # default: MrBeast's channel id
-POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL", "1"))  # seconds
-TELEGRAM_HEARTBEAT = 10  # seconds (SAFE)
-_last_telegram_sent = 0
+POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL", "1"))  # backend polling interval (seconds)
+TELEGRAM_HEARTBEAT = float(os.getenv("YT_HEARTBEAT", "10"))  # how often to send Telegram messages (seconds)
+
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment")
 
@@ -72,20 +72,6 @@ ERC1155_ABI = [
 SLUG, MARKET_IDX, OUTCOME_IDX, MODE_CHOICE, ACTION, AMOUNT, CONFIRM, SELL_CHOICE, BUY_AFTER_YN, BUY_AMOUNT, START_MONITOR = range(11)
 
 # ---------- Helpers ----------
-def can_send_telegram(force=False):
-    global _last_telegram_sent
-    now = time.time()
-
-    if force:
-        _last_telegram_sent = now
-        return True
-
-    if now - _last_telegram_sent >= TELEGRAM_HEARTBEAT:
-        _last_telegram_sent = now
-        return True
-
-    return False
-
 def fetch_active_markets(slug):
     try:
         r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
@@ -97,6 +83,7 @@ def fetch_active_markets(slug):
     except Exception as e:
         print("fetch_active_markets error:", e)
         return []
+
 
 def normalize_outcomes_and_token_ids(market):
     outcomes = market.get("outcomes", [])
@@ -112,6 +99,7 @@ def normalize_outcomes_and_token_ids(market):
         except:
             token_ids = []
     return outcomes, token_ids
+
 
 def get_mid_price(token_id):
     try:
@@ -131,6 +119,7 @@ def get_mid_price(token_id):
         print("get_mid_price error:", e)
         return None
 
+
 def get_balance_shares(token_id):
     try:
         contract = w3.eth.contract(address=w3.to_checksum_address(CONDITIONAL_TOKENS), abi=ERC1155_ABI)
@@ -139,6 +128,7 @@ def get_balance_shares(token_id):
     except Exception as e:
         print("get_balance_shares error:", e)
         return 0.0
+
 
 def place_market_order(token_id, amount, side):
     """
@@ -171,6 +161,7 @@ class YTKeyRotator:
         self.idx += 1
         return k
 
+
 async def fetch_channel_subs(session: aiohttp.ClientSession, api_key: str, channel_id: str):
     url = "https://www.googleapis.com/youtube/v3/channels"
     params = {"part": "statistics", "id": channel_id, "key": api_key}
@@ -191,6 +182,10 @@ async def fetch_channel_subs(session: aiohttp.ClientSession, api_key: str, chann
 
 # ---------- Monitoring coroutine ----------
 async def monitor_youtube_and_trigger(application: Application):
+    """Monitor YouTube every POLL_INTERVAL seconds (backend), but send Telegram updates at most
+    once every TELEGRAM_HEARTBEAT seconds. Trades are executed immediately on subscriber change,
+    but messages reporting status/trades are rate-limited by TELEGRAM_HEARTBEAT.
+    """
     print("YouTube monitor: started")
 
     rotator = YTKeyRotator(application.bot_data.get("yt_api_keys", []))
@@ -198,9 +193,13 @@ async def monitor_youtube_and_trigger(application: Application):
     chat_id = application.bot_data.get("chat_id")
 
     last_subs = None
+    last_telegram_time = 0.0
+
+    # buffer trades that happened since last message
+    trade_log = []
 
     async with aiohttp.ClientSession() as session:
-        # Initial fetch (warm-up)
+        # Initial fetch (try a few keys)
         for _ in range(3):
             key = rotator.get_key()
             if not key:
@@ -219,6 +218,7 @@ async def monitor_youtube_and_trigger(application: Application):
 
             key = rotator.get_key()
             if not key:
+                # no API keys configured: still wait at poll interval
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
 
@@ -226,12 +226,11 @@ async def monitor_youtube_and_trigger(application: Application):
 
             subs = last_subs
             changed = False
-            trade_results = []
 
             if "subs" in res:
                 subs = res["subs"]
 
-                # 🔴 PRIORITY 1: EXECUTE TRADES FIRST
+                # TRIGGER ACTIONS IMMEDIATELY if subscriber count changed
                 if subs != last_subs:
                     changed = True
 
@@ -243,53 +242,56 @@ async def monitor_youtube_and_trigger(application: Application):
                     # SELL first
                     if sell_shares > 0 and token_sell:
                         t0 = time.time()
-                        place_market_order(token_sell, sell_shares, SELL)
-                        trade_results.append(
-                            f"SELL {sell_shares:.4f} shares ({time.time() - t0:.3f}s)"
-                        )
+                        resp = place_market_order(token_sell, sell_shares, SELL)
+                        took = time.time() - t0
+                        trade_log.append(f"SELL {sell_shares:.6f} shares (took {took:.3f}s) | resp={resp}")
 
                     # BUY after sell
                     if buy_usdc > 0 and token_buy:
                         t0 = time.time()
-                        place_market_order(token_buy, buy_usdc, BUY)
-                        trade_results.append(
-                            f"BUY ${buy_usdc:.2f} YES ({time.time() - t0:.3f}s)"
-                        )
+                        resp = place_market_order(token_buy, buy_usdc, BUY)
+                        took = time.time() - t0
+                        trade_log.append(f"BUY ${buy_usdc:.2f} YES (took {took:.3f}s) | resp={resp}")
 
                     last_subs = subs
 
-            # 📢 Build Telegram message
-            msg = (
-                f"📊 MrBeast Subscriber Monitor\n"
-                f"Time: {now.strftime('%H:%M:%S')} UTC\n"
-                f"Subscribers: {subs:,}\n"
-            )
+            # Decide whether to send Telegram message now (heartbeat)
+            now_ts = time.time()
+            time_since_last_msg = now_ts - last_telegram_time
+            should_send = time_since_last_msg >= TELEGRAM_HEARTBEAT
 
-            if changed:
-                msg += "\n🚨 CHANGE DETECTED — TRADES EXECUTED FIRST\n"
-                msg += "\n".join(trade_results) if trade_results else "No trades configured"
-            else:
-                msg += "\nNo change detected."
+            if should_send:
+                # Build message including any trades that happened since last message
+                msg_lines = [
+                    f"📊 **MrBeast Subscriber Monitor**",
+                    f"Time: {now.strftime('%H:%M:%S')} UTC",
+                    f"Subscribers: {subs:,}",
+                ]
 
-            # 📢 PRIORITY 2: TELEGRAM (RATE-LIMITED HEARTBEAT)
-            try:
-                if changed:
-                    # Force send immediately after trades
-                    if can_send_telegram(force=True):
-                        await application.bot.send_message(chat_id=chat_id, text=msg)
+                if trade_log:
+                    msg_lines.append("\n🚨 **TRADES EXECUTED SINCE LAST UPDATE**")
+                    msg_lines.extend(trade_log)
+                    trade_log.clear()
                 else:
-                    # Heartbeat every 10 seconds
-                    if can_send_telegram():
-                        await application.bot.send_message(chat_id=chat_id, text=msg)
-            except Exception as e:
-                print("Telegram send error:", e)
+                    if changed:
+                        msg_lines.append("\n✅ Change detected but no trades configured.")
+                    else:
+                        msg_lines.append("\nNo change detected.")
 
-            # Maintain strict backend polling interval
+                msg_text = "\n".join(msg_lines)
+
+                try:
+                    await application.bot.send_message(chat_id=chat_id, text=msg_text)
+                except Exception as e:
+                    print("Telegram send error:", e)
+
+                last_telegram_time = now_ts
+
+            # sleep so backend polling remains at POLL_INTERVAL cadence
             elapsed = time.time() - loop_start
             await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
 
     print("YouTube monitor: stopped")
-
 
 
 # ---------- Telegram conversation handlers ----------
@@ -462,10 +464,8 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
     outcomes = user.get('outcomes', [])
     token_ids = user.get('token_ids', [])
     # Determine buy token: if two outcomes and user selected sell on 1, buy the other if it's YES
-    # Simpler: ask user to ensure they selected correct outcome earlier. We'll default token_buy = token_id of opposite if exists
     token_buy = None
     if len(token_ids) >= 2:
-        # attempt to pick the other outcome (not same index)
         sel_tok = user.get('token_id')
         for t in token_ids:
             if t != sel_tok:
@@ -478,7 +478,6 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
     app.bot_data['from_outcome'] = user.get('outcome')
     # determine human-readable target outcome label
     if token_buy and token_buy != user.get('token_id'):
-        # pick outcome label
         try:
             idx_sell = user['token_ids'].index(user['token_id'])
             idx_buy = user['token_ids'].index(token_buy)
@@ -577,6 +576,7 @@ def main():
 
     print("Bot running. Use /start. DRY_RUN =", DRY_RUN)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
