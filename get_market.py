@@ -1,368 +1,343 @@
+#!/usr/bin/env python3
 """
-Polymarket CLI trading bot — improved
-Includes:
- - Fix for ApiCreds object attribute access
- - Optional Telegram integration (polling-based) using TELEGRAM_BOT_TOKEN
+polymarket_telegram_bot.py
+
+Telegram bot to select a Polymarket event -> market -> outcome -> buy/sell -> confirm -> place market order.
+
+Requirements:
+- python 3.10+
+- python-dotenv
+- requests
+- web3
+- py-clob-client (your package)
+- python-telegram-bot >=20 (async)
+- aiohttp
+
+Install (example):
+pip install python-dotenv requests web3 python-telegram-bot aiohttp
 
 Usage:
-  1) Install dependencies:
-       pip install py-clob-client requests python-dotenv
-  2) Create a .env file with required vars (see below)
-  3) Run:
-       python polymarket_trading_bot.py
-
-Security:
- - Never commit .env or paste PRIVATE_KEY publicly.
- - Use a dedicated wallet with limited funds for bots.
-
-.env variables (minimum):
- - PRIVATE_KEY
- - WALLET_ADDRESS
-Optional for Telegram:
- - TELEGRAM_BOT_TOKEN
-
-Telegram usage:
- - Send /start to your bot to register the chat.
- - /help to see commands
- - /trade <slug> <outcome_index> <buy/sell> <price> <size>  -> queues an order and returns an order_id
- - /confirm <order_id> -> confirms and places the queued order
- - /cancel <order_id> -> cancels queued order
- - /status -> returns a short summary
-
-This script requires you to run it continuously (it polls Telegram updates). Be careful and test with tiny amounts.
+- Create a .env file with PRIVATE_KEY, WALLET_ADDRESS, TELEGRAM_BOT_TOKEN and optionally DRY_RUN=true.
+- Run: python polymarket_telegram_bot.py
 """
-
 import os
-import sys
 import json
-import time
-import threading
-import logging
 import requests
-import getpass
-from pprint import pprint
 from dotenv import load_dotenv
+from web3 import Web3
+from py_clob_client.client import ClobClient
+from py_clob_client.clob_types import MarketOrderArgs, OrderType
+from py_clob_client.order_builder.constants import BUY, SELL
+import asyncio
+from datetime import datetime, timezone
 
-# Third-party client (py_clob_client)
-try:
-    from py_clob_client.client import ClobClient
-    from py_clob_client.clob_types import OrderArgs, OrderType
-    from py_clob_client.order_builder.constants import BUY, SELL
-except Exception as e:
-    print("Missing dependencies. Run: pip install py-clob-client requests python-dotenv")
-    raise
+# Telegram imports (async)
+from telegram import Update
+from telegram.ext import (
+    Application,
+    CommandHandler,
+    MessageHandler,
+    filters,
+    ConversationHandler,
+    ContextTypes,
+)
 
-# Load .env
 load_dotenv()
 
-GAMMA_API_BASE = "https://gamma-api.polymarket.com"
-CLOB_HOST = "https://clob.polymarket.com"
-CHAIN_ID = 137  # Polygon
+# --- Config from env ---
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
+DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"  # default true for safety
 
-# Simple in-memory queue for pending telegram orders
-pending_orders = {}
-pending_lock = threading.Lock()
-next_order_id = 1
+if not all([WALLET_ADDRESS, TELEGRAM_BOT_TOKEN]):
+    raise ValueError("Set WALLET_ADDRESS and TELEGRAM_BOT_TOKEN in environment (PRIVATE_KEY optional for dry run).")
 
-# Telegram state
-telegram_token = os.getenv("TELEGRAM_BOT_TOKEN")
-telegram_offset = None
-registered_chats = set()
+# APIs
+GAMMA_API = "https://gamma-api.polymarket.com"
+CLOB_API = "https://clob.polymarket.com"
+POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com/")
+CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
 
-# Logging
-logging.basicConfig(level=os.getenv('LOG_LEVEL','INFO'))
-logger = logging.getLogger('polymarket-bot')
-
-
-def get_env_or_prompt(name, secret=False):
-    val = os.getenv(name)
-    if val:
-        return val
-    if secret:
-        return getpass.getpass(f"Enter {name}: ")
-    return input(f"Enter {name}: ")
-
-
-def fetch_market_by_slug(slug):
-    url = f"{GAMMA_API_BASE}/markets/slug/{slug}"
-    resp = requests.get(url)
-    if resp.status_code != 200:
-        logger.error("Error fetching market: %s %s", resp.status_code, resp.text)
-        return None
-    return resp.json()
-
-
-def choose_from_list(prompt, items):
-    for i, it in enumerate(items):
-        print(f"[{i}] {it}")
-    idx = input(prompt)
+# Web3 + clob client (if PRIVATE_KEY not provided, client creation is skipped and only dry-run allowed)
+w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
+client = None
+if PRIVATE_KEY:
+    client = ClobClient(
+        host=CLOB_API,
+        key=PRIVATE_KEY,
+        chain_id=137,
+        signature_type=1,
+        funder=WALLET_ADDRESS
+    )
     try:
-        idx = int(idx)
-        if 0 <= idx < len(items):
-            return idx
-    except:
-        pass
-    print("Invalid selection")
-    return None
-
-
-# Telegram helper functions
-def telegram_api(method, params=None):
-    global telegram_token
-    if not telegram_token:
-        return None
-    url = f"https://api.telegram.org/bot{telegram_token}/{method}"
-    try:
-        r = requests.post(url, data=params or {})
-        return r.json()
+        creds = client.create_or_derive_api_creds()
+        client.set_api_creds(creds)
+        print("ClobClient credentials set.")
     except Exception as e:
-        logger.exception("Telegram API error")
+        print("Warning: failed to set client creds:", e)
+
+# Minimal ERC1155 ABI for balanceOf
+ERC1155_ABI = [
+    {
+        "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
+        "name": "balanceOf",
+        "outputs": [{"name": "", "type": "uint256"}],
+        "stateMutability": "view",
+        "type": "function"
+    }
+]
+
+# Conversation states
+SLUG, MARKET_IDX, OUTCOME_IDX, ACTION, AMOUNT, CONFIRM = range(6)
+
+# Helper functions
+def fetch_active_markets(slug: str):
+    """Fetch event by slug from Gamma and return active markets list"""
+    try:
+        r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
+        r.raise_for_status()
+        event = r.json()
+        markets = event.get("markets", []) or []
+        # pick markets that are active and not closed
+        active = [m for m in markets if m.get("active", False) and not m.get("closed", True)]
+        return active
+    except Exception as e:
+        print("fetch_active_markets error:", e)
+        return []
+
+def normalize_outcomes_and_token_ids(market):
+    """Some responses encode outcomes or token ids as JSON strings; handle both."""
+    outcomes = market.get("outcomes", [])
+    token_ids = market.get("clobTokenIds", [])
+    if isinstance(outcomes, str):
+        try:
+            outcomes = json.loads(outcomes)
+        except:
+            outcomes = []
+    if isinstance(token_ids, str):
+        try:
+            token_ids = json.loads(token_ids)
+        except:
+            token_ids = []
+    return outcomes, token_ids
+
+def get_mid_price(token_id):
+    """Approx mid from order book. Returns float or None."""
+    global client
+    if not client:
+        return None
+    try:
+        book = client.get_order_book(token_id)
+        bids = [float(p) for p, _ in book.get("bids", [])] if book.get("bids") else []
+        asks = [float(p) for p, _ in book.get("asks", [])] if book.get("asks") else []
+        if bids and asks:
+            return (max(bids) + min(asks)) / 2.0
+        if bids:
+            return max(bids)
+        if asks:
+            return min(asks)
+        return None
+    except Exception as e:
+        print("get_mid_price error:", e)
         return None
 
+def get_balance_shares(token_id):
+    """Return balance in shares (assumes token decimals = 6)."""
+    try:
+        contract = w3.eth.contract(address=w3.to_checksum_address(CONDITIONAL_TOKENS), abi=ERC1155_ABI)
+        balance_wei = contract.functions.balanceOf(w3.to_checksum_address(WALLET_ADDRESS), int(token_id)).call()
+        return balance_wei / 1_000_000  # assuming 6 decimals
+    except Exception as e:
+        print("get_balance_shares error:", e)
+        return 0.0
 
-def send_telegram_message(chat_id, text):
-    return telegram_api('sendMessage', {'chat_id': chat_id, 'text': text})
+def place_market_order(token_id, amount, side):
+    """
+    Place market order using ClobClient.
+    - For BUY: amount is USDC value (float)
+    - For SELL: amount is shares to sell (float)
+    This mirrors your existing pattern. In dry-run mode we only print.
+    """
+    if DRY_RUN or client is None:
+        print(f"[DRY RUN] place_market_order: token={token_id} side={side} amount={amount}")
+        return {"status": "dry_run"}
+    try:
+        args = MarketOrderArgs(token_id=token_id, amount=amount, side=side, order_type=OrderType.FOK)
+        signed = client.create_market_order(args)
+        resp = client.post_order(signed, OrderType.FOK)
+        print("Order response:", resp)
+        return resp
+    except Exception as e:
+        print("place_market_order error:", e)
+        return None
 
+# --- Telegram handlers ---
+async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Enter Polymarket event slug (example: 'is-elon-mars-possible'):")
+    return SLUG
 
-def process_telegram_message(msg, clob_client):
-    global next_order_id
-    chat = msg.get('message') or msg.get('edited_message')
-    if not chat:
-        return
-    chat_id = chat['chat']['id']
-    text = chat.get('text','').strip()
-    logger.info('Telegram message from %s: %s', chat_id, text)
-    if text.startswith('/'):
-        parts = text.split()
-        cmd = parts[0].lower()
-        if cmd == '/start':
-            registered_chats.add(chat_id)
-            send_telegram_message(chat_id, 'Registered this chat. Use /help to see commands.')
-        elif cmd == '/help':
-            send_telegram_message(chat_id, 'Commands:\n/trade <slug> <outcome_index> <buy/sell> <price> <size>\n/confirm <order_id>\n/cancel <order_id>\n/status')
-        elif cmd == '/status':
-            # minimal status: wallet address and simple markets count
-            send_telegram_message(chat_id, f'Bot running. Wallet: {clob_client.address if hasattr(clob_client,"address") else "<unknown>"}')
-        elif cmd == '/trade':
-            # /trade slug outcome_index buy 0.44 10
-            if len(parts) < 6:
-                send_telegram_message(chat_id, 'Usage: /trade <slug> <outcome_index> <buy/sell> <price> <size>')
-                return
-            slug = parts[1]
-            try:
-                outcome_index = int(parts[2])
-                side = parts[3].lower()
-                price = float(parts[4])
-                size = float(parts[5])
-            except Exception:
-                send_telegram_message(chat_id, 'Invalid parameters. Ensure outcome_index is integer, price and size are numbers.')
-                return
-            # Fetch market to validate token id
-            market = fetch_market_by_slug(slug)
-            if not market:
-                send_telegram_message(chat_id, f'Market {slug} not found')
-                return
-            clob_token_ids = market.get('clobTokenIds') or market.get('clob_token_ids')
-            if not clob_token_ids or outcome_index < 0 or outcome_index >= len(clob_token_ids):
-                send_telegram_message(chat_id, 'Invalid outcome index for this market')
-                return
-            token_id = clob_token_ids[outcome_index]
-            side_const = BUY if side == 'buy' else SELL
-            with pending_lock:
-                oid = str(next_order_id)
-                next_order_id += 1
-                pending_orders[oid] = {
-                    'slug': slug,
-                    'token_id': token_id,
-                    'side': side,
-                    'side_const': side_const,
-                    'price': price,
-                    'size': size,
-                    'chat_id': chat_id,
-                    'market': market,
-                }
-            send_telegram_message(chat_id, f'Order queued with id {oid}. Confirm with /confirm {oid} or cancel with /cancel {oid}')
-        elif cmd == '/confirm':
-            if len(parts) < 2:
-                send_telegram_message(chat_id, 'Usage: /confirm <order_id>')
-                return
-            oid = parts[1]
-            with pending_lock:
-                order = pending_orders.get(oid)
-            if not order:
-                send_telegram_message(chat_id, f'No pending order with id {oid}')
-                return
-            # Only allow the original requester to confirm
-            if order['chat_id'] != chat_id:
-                send_telegram_message(chat_id, 'You are not the owner of this pending order')
-                return
-            # Place order
-            try:
-                order_args = OrderArgs(price=order['price'], size=order['size'], side=order['side_const'], token_id=order['token_id'])
-                signed_order = clob_client.create_order(order_args)
-                resp = clob_client.post_order(signed_order, OrderType.GTC)
-                send_telegram_message(chat_id, f'Order placed. Response: {json.dumps(resp)}')
-                with pending_lock:
-                    pending_orders.pop(oid, None)
-            except Exception as e:
-                logger.exception('Error placing order')
-                send_telegram_message(chat_id, f'Error placing order: {e}')
-        elif cmd == '/cancel':
-            if len(parts) < 2:
-                send_telegram_message(chat_id, 'Usage: /cancel <order_id>')
-                return
-            oid = parts[1]
-            with pending_lock:
-                order = pending_orders.pop(oid, None)
-            if order:
-                send_telegram_message(chat_id, f'Pending order {oid} cancelled')
-            else:
-                send_telegram_message(chat_id, f'No pending order {oid}')
+async def got_slug(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    slug = update.message.text.strip()
+    context.user_data['slug'] = slug
+    markets = fetch_active_markets(slug)
+    if not markets:
+        await update.message.reply_text("No active markets found for that slug. Try another slug or check spelling.")
+        return ConversationHandler.END
+    # store markets
+    context.user_data['markets'] = markets
+    text = f"Found {len(markets)} active market(s). Choose market number:\n\n"
+    for i, m in enumerate(markets):
+        q = m.get("question") or m.get("name") or "Unknown question"
+        text += f"{i}: {q}\n"
+    await update.message.reply_text(text)
+    return MARKET_IDX
+
+async def got_market_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        idx = int(update.message.text.strip())
+        markets = context.user_data.get('markets', [])
+        market = markets[idx]
+        outcomes, token_ids = normalize_outcomes_and_token_ids(market)
+        if not outcomes or not token_ids:
+            await update.message.reply_text("Selected market missing outcomes or token ids.")
+            return ConversationHandler.END
+        context.user_data['market'] = market
+        context.user_data['outcomes'] = outcomes
+        context.user_data['token_ids'] = token_ids
+
+        # show outcomes
+        text = "Select an outcome number:\n"
+        for i, o in enumerate(outcomes):
+            text += f"{i}: {o}\n"
+        await update.message.reply_text(text)
+        return OUTCOME_IDX
+    except Exception:
+        await update.message.reply_text("Invalid market index.")
+        return MARKET_IDX
+
+async def got_outcome_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        idx = int(update.message.text.strip())
+        outcomes = context.user_data['outcomes']
+        token_ids = context.user_data['token_ids']
+        outcome = outcomes[idx]
+        token_id = token_ids[idx]
+        context.user_data['outcome'] = outcome
+        context.user_data['token_id'] = token_id
+
+        # show mid price and ask action
+        mid = get_mid_price(token_id)
+        mid_str = f"{mid:.6f}" if mid else "N/A"
+        await update.message.reply_text(f"Selected outcome: {outcome}\nMid price: {mid_str}\n\nDo you want to Buy or Sell? (b/s)")
+        return ACTION
+    except Exception:
+        await update.message.reply_text("Invalid outcome index.")
+        return OUTCOME_IDX
+
+async def got_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    action = update.message.text.strip().lower()
+    if action not in ('b', 's'):
+        await update.message.reply_text("Please type 'b' to Buy or 's' to Sell.")
+        return ACTION
+    context.user_data['action'] = action
+    # BUY: ask USDC amount. SELL: ask shares to sell (will check balance)
+    if action == 'b':
+        await update.message.reply_text("Enter USDC amount to BUY (example: 10.0):")
+    else:
+        # check balance
+        token_id = context.user_data['token_id']
+        bal = get_balance_shares(token_id)
+        context.user_data['balance'] = bal
+        await update.message.reply_text(f"Your balance on this outcome: {bal:.6f} shares\nEnter number of shares to SELL (e.g. 0.5):")
+    return AMOUNT
+
+async def got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip()
+    try:
+        val = float(txt)
+        if val <= 0:
+            raise ValueError
+        action = context.user_data['action']
+        token_id = context.user_data['token_id']
+        outcome = context.user_data['outcome']
+
+        if action == 's':
+            # validate shares <= balance
+            bal = context.user_data.get('balance', 0)
+            if val > bal:
+                await update.message.reply_text(f"Requested sell shares ({val}) exceed balance ({bal}). Enter a smaller amount.")
+                return AMOUNT
+            # estimate USDC from mid price
+            mid = get_mid_price(token_id)
+            est_usdc = val * mid if mid else None
+            est_str = f"≈ ${est_usdc:.2f}" if est_usdc else "N/A"
+            context.user_data['amount'] = val  # shares
+            await update.message.reply_text(f"SELL {val:.6f} shares of {outcome} {est_str}\nConfirm? (y/n)")
+            return CONFIRM
         else:
-            send_telegram_message(chat_id, 'Unknown command. Use /help')
+            # BUY: val is USDC to spend
+            mid = get_mid_price(token_id)
+            est_shares = val / mid if mid and mid > 0 else None
+            est_str = f"≈ {est_shares:.6f} shares" if est_shares else "N/A"
+            context.user_data['amount'] = val  # USDC
+            await update.message.reply_text(f"BUY ${val:.2f} USDC of {outcome} {est_str}\nConfirm? (y/n)")
+            return CONFIRM
+    except Exception:
+        await update.message.reply_text("Invalid numeric amount. Try again.")
+        return AMOUNT
 
+async def got_confirm(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    txt = update.message.text.strip().lower()
+    if 'y' not in txt:
+        await update.message.reply_text("Cancelled.")
+        return ConversationHandler.END
 
-def telegram_polling_loop(clob_client):
-    global telegram_offset
-    if not telegram_token:
-        logger.info('No TELEGRAM_BOT_TOKEN set — skipping telegram integration')
-        return
-    logger.info('Starting telegram polling...')
-    while True:
-        try:
-            url = f'https://api.telegram.org/bot{telegram_token}/getUpdates'
-            params = {}
-            if telegram_offset:
-                params['offset'] = telegram_offset
-            r = requests.get(url, params=params, timeout=60)
-            data = r.json()
-            if not data.get('ok'):
-                time.sleep(2)
-                continue
-            for upd in data.get('result', []):
-                telegram_offset = upd['update_id'] + 1
-                process_telegram_message(upd, clob_client)
-        except Exception:
-            logger.exception('Telegram polling error')
-            time.sleep(5)
+    action = context.user_data['action']
+    token_id = context.user_data['token_id']
+    outcome = context.user_data['outcome']
+    amt = context.user_data['amount']
 
+    if action == 'b':
+        # amt is USDC value to buy
+        resp = place_market_order(token_id, amt, BUY)
+        await update.message.reply_text(f"BUY order placed (or simulated). Response: {resp}")
+    else:
+        # amt is shares to sell
+        resp = place_market_order(token_id, amt, SELL)
+        await update.message.reply_text(f"SELL order placed (or simulated). Response: {resp}")
+
+    return ConversationHandler.END
+
+async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text("Flow cancelled.")
+    return ConversationHandler.END
+
+async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    await update.message.reply_text(f"DRY_RUN={DRY_RUN}. Clob client available: {client is not None}")
 
 def main():
-    # Read credentials securely
-    private_key = os.getenv('PRIVATE_KEY')
-    if not private_key:
-        print('PRIVATE_KEY not set in environment. You can paste it now (it will not be echoed).')
-        private_key = getpass.getpass('Private key: ')
+    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    wallet_address = os.getenv('WALLET_ADDRESS') or input('Your wallet address (0x...): ')
+    conv = ConversationHandler(
+        entry_points=[CommandHandler("start", start)],
+        states={
+            SLUG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_slug)],
+            MARKET_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_market_idx)],
+            OUTCOME_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_outcome_idx)],
+            ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_action)],
+            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_amount)],
+            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_confirm)],
+        },
+        fallbacks=[CommandHandler("cancel", cancel)],
+        allow_reentry=True
+    )
 
-    signature_type_env = os.getenv('SIGNATURE_TYPE')
-    signature_type = int(signature_type_env) if signature_type_env else 1
-    funder = os.getenv('POLYMARKET_PROXY_ADDRESS') or None
+    app.add_handler(conv)
+    app.add_handler(CommandHandler("status", status))
 
-    # Initialize client
-    client_args = dict(host=CLOB_HOST, key=private_key, chain_id=CHAIN_ID)
-    if signature_type in (1, 2, 3):
-        client_args.update({"signature_type": signature_type})
-        if signature_type == 1 and funder:
-            client_args["funder"] = funder
+    print("Bot started. Use /start in Telegram. DRY_RUN =", DRY_RUN)
+    app.run_polling()
 
-    clob_client = ClobClient(**client_args)
-
-    # Derive API creds (one-time; safe to run every start)
-    logger.info('Deriving API credentials (private key used locally to derive API key)...')
-    api_creds = clob_client.create_or_derive_api_creds()
-
-    # api_creds may be a dict-like, dataclass, or object. Normalize to dict for safe access & logging.
-    try:
-        if isinstance(api_creds, dict):
-            creds = api_creds
-        elif hasattr(api_creds, 'to_dict'):
-            creds = api_creds.to_dict()
-        else:
-            # fallback: try __dict__
-            creds = getattr(api_creds, '__dict__', {}) or {k: getattr(api_creds,k) for k in dir(api_creds) if not k.startswith('_') and not callable(getattr(api_creds,k))}
-    except Exception:
-        creds = {}
-
-    # Print whichever key name exists
-    api_key_val = creds.get('apiKey') or creds.get('api_key') or creds.get('apiKeyHex') or creds.get('apiKeyHexString') or creds.get('apiKeyHex')
-    logger.info('API credentials derived. API key (partial): %s', str(api_key_val)[:8] if api_key_val else '<unknown>')
-
-    # set the creds back on the client if required (py_clob_client may accept object or dict)
-    try:
-        clob_client.set_api_creds(api_creds)
-    except Exception:
-        try:
-            clob_client.set_api_creds(creds)
-        except Exception:
-            logger.exception('Failed to set API creds on client — continuing but you may see auth errors')
-
-    # Start telegram polling thread if token present
-    if telegram_token:
-        t = threading.Thread(target=telegram_polling_loop, args=(clob_client,), daemon=True)
-        t.start()
-
-    # Interactive CLI loop (simple)
-    print('Polymarket CLI trading bot — interactive mode. Type HELP for commands or use Telegram.')
-    print('Commands: get <slug>, trade <slug> <outcome_index> <buy/sell> <price> <size>, exit')
-
-    while True:
-        try:
-            cmd = input('> ').strip()
-        except (EOFError, KeyboardInterrupt):
-            print('\nExiting')
-            break
-        if not cmd:
-            continue
-        parts = cmd.split()
-        if parts[0].lower() == 'exit':
-            break
-        if parts[0].lower() == 'get' and len(parts) >= 2:
-            slug = parts[1]
-            m = fetch_market_by_slug(slug)
-            pprint(m)
-            continue
-        if parts[0].lower() == 'trade' and len(parts) >= 6:
-            _, slug, outcome_idx_s, side, price_s, size_s = parts[:6]
-            try:
-                outcome_idx = int(outcome_idx_s)
-                price = float(price_s)
-                size = float(size_s)
-            except Exception:
-                print('Invalid numeric params')
-                continue
-            market = fetch_market_by_slug(slug)
-            if not market:
-                print('Market not found')
-                continue
-            clob_token_ids = market.get('clobTokenIds') or market.get('clob_token_ids')
-            if not clob_token_ids or outcome_idx < 0 or outcome_idx >= len(clob_token_ids):
-                print('Invalid outcome index')
-                continue
-            token_id = clob_token_ids[outcome_idx]
-            side_const = BUY if side.lower() == 'buy' else SELL
-            print('Summary:')
-            print(f'Slug: {slug}\nToken: {token_id}\nSide: {side}\nPrice: {price}\nSize: {size}')
-            confirm = input('Type YES to confirm: ').strip()
-            if confirm != 'YES':
-                print('Cancelled')
-                continue
-            try:
-                order_args = OrderArgs(price=price, size=size, side=side_const, token_id=token_id)
-                signed_order = clob_client.create_order(order_args)
-                resp = clob_client.post_order(signed_order, OrderType.GTC)
-                print('Order response:')
-                pprint(resp)
-                # Notify registered telegram chats
-                for chat in list(registered_chats):
-                    send_telegram_message(chat, f'Order placed via CLI. Response: {resp}')
-            except Exception as e:
-                logger.exception('Error placing order')
-                print('Error placing order:', e)
-            continue
-        print('Unknown command')
-
-
-if __name__ == '__main__':
+if __name__ == "__main__":
     main()
