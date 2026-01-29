@@ -48,7 +48,7 @@ CLOB_API = "https://clob.polymarket.com"
 POLYGON_RPC = "https://polygon-rpc.com/"
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 CHANNEL_ID = "UCX6OQ3DkcsbYNE6H8uQQuVA"  # MrBeast
-CHECK_INTERVAL = 5  # YouTube updates are delayed; no need for sub-second polling
+CHECK_INTERVAL = 5  # YouTube subscriber count updates slowly — no need for aggressive polling
 
 ERC1155_ABI = [
     {
@@ -66,10 +66,12 @@ client = ClobClient(
     host=CLOB_API,
     key=PRIVATE_KEY,
     chain_id=137,
-    signature_type=1,  # Critical fix — EIP-712 signing required for Polymarket
+    signature_type=1,  # Critical: EIP-712 signing required for Polymarket
     funder=WALLET_ADDRESS
 )
 
+# Optional but RECOMMENDED: Use manual API keys from Polymarket site for maximum reliability
+# Comment out the try/except block below and use api_key/secret/passphrase instead if you have them
 try:
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
@@ -80,7 +82,7 @@ except Exception as e:
 
 print(f"Connected to Polymarket with wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}")
 print(f"Dry run mode: {DRY_RUN}")
-print("IMPORTANT: Ensure USDC & conditional token approvals are set!")
+print("IMPORTANT: Ensure USDC & conditional token approvals are set for the Polymarket proxy contracts!")
 
 # Conversation states
 SLUG, MARKET_IDX, NUM_OUTCOMES, OUTCOME1_IDX, OUTCOME2_IDX, ACTION, BUY_AMOUNT, CONFIRM_BUY, SELL_CHOICE, CUSTOM_SELL, AUTO_BUY_YN, AUTO_BUY_AMOUNT, START_MONITOR = range(13)
@@ -222,7 +224,7 @@ async def monitor_subscriber_increase(application: Application):
                 sell_amount = application.bot_data.get('sell_amount', 0)
                 from_outcome = application.bot_data.get('from_outcome')
 
-                # SELL first
+                # SELL first (priority)
                 if sell_amount > 0 and token_id_sell:
                     balance = get_balance(token_id_sell)
                     actual_sell = min(balance, sell_amount)
@@ -230,11 +232,11 @@ async def monitor_subscriber_increase(application: Application):
                         sell_start = time.time()
                         sell_result = place_market_order(token_id_sell, actual_sell, SELL)
                         sell_dur = time.time() - sell_start
-                        if sell_result.get("status") == "dry_run" or (sell_result and "error" not in sell_result):
+                        if sell_result.get("status") == "dry_run" or (isinstance(sell_result, dict) and "error" not in sell_result):
                             prefix = "[DRY RUN] " if DRY_RUN else ""
                             results.append(f"{prefix}✅ SOLD {actual_sell:.4f} shares of {from_outcome} (took {sell_dur:.3f}s)")
                         else:
-                            err = sell_result.get("error", "Unknown error") if sell_result else "No response"
+                            err = sell_result.get("error", "Unknown error") if isinstance(sell_result, dict) else "No response"
                             results.append(f"❌ SELL FAILED: {err} (took {sell_dur:.3f}s)")
                     else:
                         results.append("⚠️ Insufficient balance to sell")
@@ -248,11 +250,11 @@ async def monitor_subscriber_increase(application: Application):
                     buy_start = time.time()
                     buy_result = place_market_order(token_id_buy, buy_usdc, BUY)
                     buy_dur = time.time() - buy_start
-                    if buy_result.get("status") == "dry_run" or (buy_result and "error" not in buy_result):
+                    if buy_result.get("status") == "dry_run" or (isinstance(buy_result, dict) and "error" not in buy_result):
                         prefix = "[DRY RUN] " if DRY_RUN else ""
                         results.append(f"{prefix}✅ BOUGHT ${buy_usdc:.2f} of {target_outcome} (took {buy_dur:.3f}s)")
                     else:
-                        err = buy_result.get("error", "Unknown error") if buy_result else "No response"
+                        err = buy_result.get("error", "Unknown error") if isinstance(buy_result, dict) else "No response"
                         results.append(f"❌ BUY FAILED: {err} (took {buy_dur:.3f}s)")
 
                 total_dur = time.time() - total_start
@@ -260,7 +262,7 @@ async def monitor_subscriber_increase(application: Application):
                 trigger_msg += "\n".join(results) if results else "No actions performed."
 
                 await safe_send_message(application.bot, chat_id, trigger_msg)
-                await safe_send_message(application.bot, chat_id, "Monitoring stopped after trigger.")
+                await safe_send_message(application.bot, chat_id, "Monitoring stopped after single trigger.")
                 application.bot_data['monitoring'] = False
                 break
 
@@ -412,17 +414,17 @@ async def confirm_buy(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int
     token_id = context.user_data['token_id1']
     usdc = context.user_data['initial_usdc']
     result = place_market_order(token_id, usdc, BUY)
-    bal = get_balance(token_id)
+    bal = get_balance(token_id)  # Refresh balance after buy
     context.user_data['balance'] = bal
 
-    if result.get("status") == "dry_run" or (result and "error" not in result):
+    if result.get("status") == "dry_run" or (isinstance(result, dict) and "error" not in result):
         prefix = "[DRY RUN] " if DRY_RUN else ""
         await update.message.reply_text(
             f"{prefix}✅ Initial BUY executed. New balance: {bal:.4f} shares\n\n"
             "Now set SELL amount on trigger:\n1=25% 2=50% 3=100% 4=custom\nChoice:"
         )
     else:
-        err = result.get("error", "Unknown error")
+        err = result.get("error", "Unknown error") if isinstance(result, dict) else "Unknown"
         await update.message.reply_text(
             f"❌ Initial BUY FAILED: {err}\nUsing current balance {bal:.4f} anyway.\n\n"
             "Set SELL amount on trigger:\n1=25% 2=50% 3=100% 4=custom\nChoice:"
@@ -475,7 +477,7 @@ async def get_auto_buy_yn(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
         return AUTO_BUY_AMOUNT
     else:
         context.user_data['buy_usdc'] = 0
-        msg = await build_confirm_message(context)
+        msg = build_confirm_message(context)
         await update.message.reply_text(msg)
         return START_MONITOR
 
@@ -485,14 +487,14 @@ async def get_auto_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE
         if amount <= 0:
             raise ValueError
         context.user_data['buy_usdc'] = amount
-        msg = await build_confirm_message(context)
+        msg = build_confirm_message(context)
         await update.message.reply_text(msg)
         return START_MONITOR
     except:
         await update.message.reply_text("Invalid amount.")
         return AUTO_BUY_AMOUNT
 
-async def build_confirm_message(context: ContextTypes.DEFAULT_TYPE) -> str:
+def build_confirm_message(context: ContextTypes.DEFAULT_TYPE) -> str:
     from_o = context.user_data['outcome1']
     target_o = context.user_data.get('outcome2') or from_o
     sell_amt = context.user_data.get('sell_amount', 0)
@@ -531,6 +533,7 @@ async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     application.bot_data['chat_id'] = update.effective_chat.id
     application.bot_data['market_question'] = context.user_data['market'].get('question', 'Unknown')
     application.bot_data['monitoring'] = True
+    application.bot_data['key_index'] = 0  # Reset key index on new monitor
 
     application.create_task(monitor_subscriber_increase(application))
     await update.message.reply_text("🚀 Monitoring started! Will execute instantly on subscriber increase.")
@@ -541,7 +544,7 @@ async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     return ConversationHandler.END
 
 async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    update.effective_application.bot_data['monitoring'] = False
+    context.application.bot_data['monitoring'] = False
     await update.message.reply_text("Monitoring stopped.")
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
