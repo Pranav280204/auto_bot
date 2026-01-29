@@ -41,7 +41,8 @@ CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87
 YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
 YT_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCX6OQ3DkcsbYNE6H8uQQuVA")  # default: MrBeast's channel id
 POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL", "1"))  # seconds
-
+TELEGRAM_HEARTBEAT = 10  # seconds (SAFE)
+_last_telegram_sent = 0
 if not TELEGRAM_BOT_TOKEN:
     raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment")
 
@@ -71,6 +72,20 @@ ERC1155_ABI = [
 SLUG, MARKET_IDX, OUTCOME_IDX, MODE_CHOICE, ACTION, AMOUNT, CONFIRM, SELL_CHOICE, BUY_AFTER_YN, BUY_AMOUNT, START_MONITOR = range(11)
 
 # ---------- Helpers ----------
+def can_send_telegram(force=False):
+    global _last_telegram_sent
+    now = time.time()
+
+    if force:
+        _last_telegram_sent = now
+        return True
+
+    if now - _last_telegram_sent >= TELEGRAM_HEARTBEAT:
+        _last_telegram_sent = now
+        return True
+
+    return False
+
 def fetch_active_markets(slug):
     try:
         r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
@@ -185,7 +200,7 @@ async def monitor_youtube_and_trigger(application: Application):
     last_subs = None
 
     async with aiohttp.ClientSession() as session:
-        # Initial fetch
+        # Initial fetch (warm-up)
         for _ in range(3):
             key = rotator.get_key()
             if not key:
@@ -209,14 +224,14 @@ async def monitor_youtube_and_trigger(application: Application):
 
             res = await fetch_channel_subs(session, key, channel_id)
 
-            trade_results = []
             subs = last_subs
             changed = False
+            trade_results = []
 
             if "subs" in res:
                 subs = res["subs"]
 
-                # 🔴 PRIORITY: TRIGGER ACTION FIRST
+                # 🔴 PRIORITY 1: EXECUTE TRADES FIRST
                 if subs != last_subs:
                     changed = True
 
@@ -230,7 +245,7 @@ async def monitor_youtube_and_trigger(application: Application):
                         t0 = time.time()
                         place_market_order(token_sell, sell_shares, SELL)
                         trade_results.append(
-                            f"SELL {sell_shares:.4f} shares ({time.time()-t0:.3f}s)"
+                            f"SELL {sell_shares:.4f} shares ({time.time() - t0:.3f}s)"
                         )
 
                     # BUY after sell
@@ -238,34 +253,43 @@ async def monitor_youtube_and_trigger(application: Application):
                         t0 = time.time()
                         place_market_order(token_buy, buy_usdc, BUY)
                         trade_results.append(
-                            f"BUY ${buy_usdc:.2f} YES ({time.time()-t0:.3f}s)"
+                            f"BUY ${buy_usdc:.2f} YES ({time.time() - t0:.3f}s)"
                         )
 
                     last_subs = subs
 
-            # 📢 TELEGRAM MESSAGE (EVERY 1.8s)
+            # 📢 Build Telegram message
             msg = (
-                f"📊 **MrBeast Subscriber Monitor**\n"
+                f"📊 MrBeast Subscriber Monitor\n"
                 f"Time: {now.strftime('%H:%M:%S')} UTC\n"
                 f"Subscribers: {subs:,}\n"
             )
 
             if changed:
-                msg += "\n🚨 **CHANGE DETECTED — TRADES EXECUTED FIRST**\n"
+                msg += "\n🚨 CHANGE DETECTED — TRADES EXECUTED FIRST\n"
                 msg += "\n".join(trade_results) if trade_results else "No trades configured"
             else:
                 msg += "\nNo change detected."
 
+            # 📢 PRIORITY 2: TELEGRAM (RATE-LIMITED HEARTBEAT)
             try:
-                await application.bot.send_message(chat_id=chat_id, text=msg)
+                if changed:
+                    # Force send immediately after trades
+                    if can_send_telegram(force=True):
+                        await application.bot.send_message(chat_id=chat_id, text=msg)
+                else:
+                    # Heartbeat every 10 seconds
+                    if can_send_telegram():
+                        await application.bot.send_message(chat_id=chat_id, text=msg)
             except Exception as e:
                 print("Telegram send error:", e)
 
-            # keep strict 1.8s cadence
+            # Maintain strict backend polling interval
             elapsed = time.time() - loop_start
             await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
 
     print("YouTube monitor: stopped")
+
 
 
 # ---------- Telegram conversation handlers ----------
