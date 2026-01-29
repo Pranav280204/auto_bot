@@ -175,14 +175,17 @@ async def fetch_channel_subs(session: aiohttp.ClientSession, api_key: str, chann
         return {"error": str(e)}
 
 # ---------- Monitoring coroutine ----------
-async def monitor_youtube_and_trigger(application: "Application"):
+async def monitor_youtube_and_trigger(application: Application):
     print("YouTube monitor: started")
+
     rotator = YTKeyRotator(application.bot_data.get("yt_api_keys", []))
-    channel_id = application.bot_data.get("yt_channel_id", YT_CHANNEL_ID)
+    channel_id = application.bot_data.get("yt_channel_id")
+    chat_id = application.bot_data.get("chat_id")
+
     last_subs = None
 
     async with aiohttp.ClientSession() as session:
-        # initial population
+        # Initial fetch
         for _ in range(3):
             key = rotator.get_key()
             if not key:
@@ -191,72 +194,79 @@ async def monitor_youtube_and_trigger(application: "Application"):
             if "subs" in res:
                 last_subs = res["subs"]
                 break
+
         if last_subs is None:
             last_subs = 0
 
-        # loop
         while application.bot_data.get("yt_monitoring", False):
-            start_t = time.time()
+            loop_start = time.time()
+            now = datetime.now(timezone.utc)
+
             key = rotator.get_key()
             if not key:
-                # no keys => skip checks but sleep
                 await asyncio.sleep(POLL_INTERVAL)
                 continue
+
             res = await fetch_channel_subs(session, key, channel_id)
-            now = datetime.now(timezone.utc)
+
+            trade_results = []
+            subs = last_subs
+            changed = False
+
             if "subs" in res:
                 subs = res["subs"]
+
+                # 🔴 PRIORITY: TRIGGER ACTION FIRST
                 if subs != last_subs:
-                    # PRIORITIZE actions: SELL first then BUY
-                    appbd = application.bot_data
-                    chat_id = appbd.get("chat_id")
-                    token_sell = appbd.get("token_id_sell")
-                    token_buy = appbd.get("token_id_buy")
-                    sell_shares = appbd.get("sell_shares", 0.0)
-                    buy_usdc = appbd.get("buy_usdc", 0.0)
-                    from_outcome = appbd.get("from_outcome")
-                    target_outcome = appbd.get("target_outcome")
+                    changed = True
 
-                    results = []
-                    # SELL
-                    if sell_shares and token_sell:
-                        sell_start = time.time()
-                        sell_resp = place_market_order(token_sell, sell_shares, SELL)
-                        sell_dur = time.time() - sell_start
-                        results.append(f"SELL {sell_shares:.6f} shares of {from_outcome} (took {sell_dur:.3f}s)")
-                    # BUY
-                    if buy_usdc and token_buy:
-                        buy_start = time.time()
-                        buy_resp = place_market_order(token_buy, buy_usdc, BUY)
-                        buy_dur = time.time() - buy_start
-                        results.append(f"BUY ${buy_usdc:.2f} USDC of {target_outcome} (took {buy_dur:.3f}s)")
+                    token_sell = application.bot_data.get("token_id_sell")
+                    sell_shares = application.bot_data.get("sell_shares", 0)
+                    token_buy = application.bot_data.get("token_id_buy")
+                    buy_usdc = application.bot_data.get("buy_usdc", 0)
 
-                    # After orders executed (or simulated) send notification summarizing
-                    msg = f"🚨 Subscriber count changed: {last_subs} → {subs} (at {now.strftime('%Y-%m-%d %H:%M:%S UTC')})\n\n"
-                    if results:
-                        msg += "\n".join(results)
-                    else:
-                        msg += "No actions configured."
-                    # send message (try/except to avoid raising)
-                    if chat_id:
-                        try:
-                            await application.bot.send_message(chat_id=chat_id, text=msg)
-                        except Exception as e:
-                            print("Failed to send Telegram message:", e)
-                    # also update last_subs
+                    # SELL first
+                    if sell_shares > 0 and token_sell:
+                        t0 = time.time()
+                        place_market_order(token_sell, sell_shares, SELL)
+                        trade_results.append(
+                            f"SELL {sell_shares:.4f} shares ({time.time()-t0:.3f}s)"
+                        )
+
+                    # BUY after sell
+                    if buy_usdc > 0 and token_buy:
+                        t0 = time.time()
+                        place_market_order(token_buy, buy_usdc, BUY)
+                        trade_results.append(
+                            f"BUY ${buy_usdc:.2f} YES ({time.time()-t0:.3f}s)"
+                        )
+
                     last_subs = subs
-                else:
-                    # If you want updates even when unchanged, uncomment next lines.
-                    pass
-            else:
-                # error - optionally log or rotate keys
-                print("YouTube fetch error:", res.get("error"))
 
-            # sleep respecting poll interval minus time taken
-            elapsed = time.time() - start_t
-            to_sleep = max(0, POLL_INTERVAL - elapsed)
-            await asyncio.sleep(to_sleep)
+            # 📢 TELEGRAM MESSAGE (EVERY 1.8s)
+            msg = (
+                f"📊 **MrBeast Subscriber Monitor**\n"
+                f"Time: {now.strftime('%H:%M:%S')} UTC\n"
+                f"Subscribers: {subs:,}\n"
+            )
+
+            if changed:
+                msg += "\n🚨 **CHANGE DETECTED — TRADES EXECUTED FIRST**\n"
+                msg += "\n".join(trade_results) if trade_results else "No trades configured"
+            else:
+                msg += "\nNo change detected."
+
+            try:
+                await application.bot.send_message(chat_id=chat_id, text=msg)
+            except Exception as e:
+                print("Telegram send error:", e)
+
+            # keep strict 1.8s cadence
+            elapsed = time.time() - loop_start
+            await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
+
     print("YouTube monitor: stopped")
+
 
 # ---------- Telegram conversation handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
