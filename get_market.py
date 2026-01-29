@@ -24,7 +24,7 @@ CLOB_API = "https://clob.polymarket.com"
 POLYGON_RPC = "https://polygon-rpc.com/"
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 
-# === DEBUG: Verify key and address ===
+# === DEBUG INFO (no mismatch check) ===
 print("=== DEBUG INFO ===")
 print(f"PRIVATE_KEY (truncated): {PRIVATE_KEY[:10]}...{PRIVATE_KEY[-6:]}")
 print(f"WALLET_ADDRESS: {WALLET_ADDRESS}")
@@ -33,10 +33,6 @@ try:
     acct = Account.from_key(PRIVATE_KEY)
     derived = acct.address.lower()
     print(f"Derived address from key: {derived}")
-    if derived != WALLET_ADDRESS.lower():
-        print("⚠️ MISMATCH! For Magic Link, WALLET_ADDRESS must be your PROXY address from polymarket.com/settings")
-    else:
-        print("Addresses match")
 except Exception as e:
     print(f"Invalid PRIVATE_KEY: {e}")
     exit(1)
@@ -112,7 +108,7 @@ def place_market_order(token_id, amount, side):
         traceback.print_exc()
 
 # === Main flow ===
-print("=== Polymarket Simple Buy/Sell Test ===")
+print("=== Polymarket Simple Buy/Sell Test ===\n")
 
 slug = input("1) Enter event slug: ").strip()
 markets = fetch_active_markets(slug)
@@ -139,9 +135,9 @@ print("\nOutcomes:")
 for i, (outcome, tid) in enumerate(zip(outcomes, token_ids)):
     mid = get_mid_price(tid) or "N/A"
     bal = get_balance(tid)
-    print(f"{i}: {outcome} | Mid price: {mid:.4f} | Your balance: {bal:.4f} shares")
+    print(f"{i}: {outcome} | Mid price: {mid:.4f if isinstance(mid, float) else mid} | Your balance: {bal:.4f} shares")
 
-outcome_idx = int(input("\n3) Select outcome number (0 for YES, etc.): "))
+outcome_idx = int(input("\n3) Select outcome number: "))
 token_id = token_ids[outcome_idx]
 outcome_name = outcomes[outcome_idx]
 mid = get_mid_price(token_id) or 0.5
