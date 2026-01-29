@@ -79,8 +79,8 @@ except Exception as e:
 print(f"Connected to Polymarket with wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}")
 print(f"Dry run mode: {DRY_RUN}")
 
-# Conversation states (no target subs)
-SLUG, MARKET_IDX, SELL_OUTCOME_IDX, SELL_CHOICE, AUTO_BUY_YN, AUTO_BUY_AMOUNT, START_MONITOR = range(7)
+# Conversation states
+SLUG, MARKET_IDX, ACTION_TYPE, NORMAL_BUY_OUTCOME, NORMAL_BUY_AMOUNT, NORMAL_SELL_OUTCOME, NORMAL_SELL_CHOICE, TRIGGER_SELL_OUTCOME, TRIGGER_SELL_CHOICE, AUTO_BUY_YN, AUTO_BUY_AMOUNT, START_MONITOR = range(12)
 
 def fetch_active_markets(slug):
     url = f"{GAMMA_API}/events/slug/{slug}"
@@ -188,7 +188,7 @@ async def monitor_mrbeast_subs(application: Application):
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            # Send update every ~10s
+            # Frequent update
             update_msg = f"Current: {current_subs:,} subscribers"
             if last_subs is not None:
                 delta = current_subs - last_subs
@@ -198,9 +198,6 @@ async def monitor_mrbeast_subs(application: Application):
                     update_msg += "\nNo change yet"
             else:
                 update_msg += "\n(Initial count set - waiting for increase)"
-
-            if not initial_set and last_subs is None:
-                update_msg += "\nWaiting for first increase to trigger..."
 
             await safe_send_message(application.bot, chat_id, update_msg)
 
@@ -236,7 +233,7 @@ async def monitor_mrbeast_subs(application: Application):
                     else:
                         results.append("⚠️ No shares to sell.")
 
-                # PRIORITY 2: Then BUY Yes
+                # PRIORITY 2: Then BUY opposite
                 buy_dur = 0.0
                 buy_usdc = application.bot_data.get('buy_usdc', 0)
                 token_id_buy = application.bot_data.get('token_id_buy')
@@ -253,7 +250,7 @@ async def monitor_mrbeast_subs(application: Application):
                 if results:
                     trigger_msg += "\n".join(results)
                 else:
-                    trigger_msg += "No actions performed."
+                    trigger_msg += destas "No actions performed."
 
                 await safe_send_message(application.bot, chat_id, trigger_msg)
                 await safe_send_message(application.bot, chat_id, "Monitoring stopped after trigger.")
@@ -304,16 +301,126 @@ async def get_market_idx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> 
         context.user_data['outcomes'] = outcomes
         context.user_data['token_ids'] = token_ids
 
-        text = "3) Select outcome to SELL on trigger (0 for Yes, 1 for No - usually 1):\n"
-        for i, o in enumerate(outcomes):
-            text += f"{i}: {o}\n"
-        await update.message.reply_text(text)
-        return SELL_OUTCOME_IDX
+        await update.message.reply_text(
+            "Select action:\n"
+            "1. Normal buy\n"
+            "2. Normal sell\n"
+            "3. Trigger action on subscriber increase\n"
+            "Choice (1/2/3):"
+        )
+        return ACTION_TYPE
     except:
         await update.message.reply_text("Invalid market number.")
         return MARKET_IDX
 
-async def get_sell_outcome_idx(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def get_action_type(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ch = update.message.text.strip()
+    outcomes = context.user_data['outcomes']
+
+    if ch == "1":
+        text = "Normal BUY selected\nSelect outcome to BUY:\n"
+        for i, o in enumerate(outcomes):
+            text += f"{i}: {o}\n"
+        await update.message.reply_text(text)
+        return NORMAL_BUY_OUTCOME
+    elif ch == "2":
+        text = "Normal SELL selected\nSelect outcome to SELL:\n"
+        for i, o in enumerate(outcomes):
+            text += f"{i}: {o}\n"
+        await update.message.reply_text(text)
+        return NORMAL_SELL_OUTCOME
+    elif ch == "3":
+        text = "Trigger action selected\nSelect outcome to SELL on trigger (0 for Yes, 1 for No - usually 1):\n"
+        for i, o in enumerate(outcomes):
+            text += f"{i}: {o}\n"
+        await update.message.reply_text(text)
+        return TRIGGER_SELL_OUTCOME
+    else:
+        await update.message.reply_text("Invalid choice. Please enter 1, 2, or 3.")
+        return ACTION_TYPE
+
+# Normal BUY flow
+async def normal_buy_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        idx = int(update.message.text.strip())
+        if idx not in [0, 1]:
+            raise ValueError
+        token_id = context.user_data['token_ids'][idx]
+        outcome = context.user_data['outcomes'][idx]
+        context.user_data['normal_token_id'] = token_id
+        context.user_data['normal_outcome'] = outcome
+        await update.message.reply_text(f"Selected: {outcome}\nEnter USDC amount to BUY:")
+        return NORMAL_BUY_AMOUNT
+    except:
+        await update.message.reply_text("Invalid index (0 or 1).")
+        return NORMAL_BUY_OUTCOME
+
+async def normal_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        amount = float(update.message.text.strip())
+        if amount <= 0:
+            raise ValueError
+        token_id = context.user_data['normal_token_id']
+        outcome = context.user_data['normal_outcome']
+        mid = get_mid_price(token_id)
+        est_shares = amount / mid if mid and mid > 0 else "?"
+        result = place_market_order(token_id, amount, BUY)
+        msg = f"✅ Normal BUY executed: ${amount:.2f} on {outcome}\nEstimated ≈ {est_shares} shares"
+        if DRY_RUN:
+            msg = "[DRY RUN] " + msg
+        await update.message.reply_text(msg)
+        return ConversationHandler.END
+    except:
+        await update.message.reply_text("Invalid amount.")
+        return NORMAL_BUY_AMOUNT
+
+# Normal SELL flow
+async def normal_sell_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    try:
+        idx = int(update.message.text.strip())
+        if idx not in [0, 1]:
+            raise ValueError
+        token_id = context.user_data['token_ids'][idx]
+        outcome = context.user_data['outcomes'][idx]
+        balance = get_balance(token_id)
+        context.user_data['normal_token_id'] = token_id
+        context.user_data['normal_outcome'] = outcome
+        context.user_data['normal_balance'] = balance
+        await update.message.reply_text(
+            f"Selected to SELL: {outcome}\n"
+            f"Current balance: {balance:.4f} shares\n\n"
+            "How much to sell (% of balance):\n"
+            "1 = 25%\n2 = 50%\n3 = 100%\nChoice:"
+        )
+        return NORMAL_SELL_CHOICE
+    except:
+        await update.message.reply_text("Invalid index (0 or 1).")
+        return NORMAL_SELL_OUTCOME
+
+async def normal_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+    ch = update.message.text.strip()
+    if ch not in ['1', '2', '3']:
+        await update.message.reply_text("Please choose 1, 2, or 3.")
+        return NORMAL_SELL_CHOICE
+
+    percs = {'1': 0.25, '2': 0.50, '3': 1.00}
+    perc = percs[ch]
+    token_id = context.user_data['normal_token_id']
+    outcome = context.user_data['normal_outcome']
+    balance = get_balance(token_id)  # refresh balance
+    sell_amount = balance * perc
+    mid = get_mid_price(token_id)
+    est_usd = sell_amount * mid if mid else "?"
+
+    result = place_market_order(token_id, sell_amount, SELL)
+    msg = f"✅ Normal SELL executed: {sell_amount:.4f} shares ({perc*100:.0f}%) of {outcome}\n≈ ${est_usd}"
+    if DRY_RUN:
+        msg = "[DRY RUN] " + msg
+    await update.message.reply_text(msg)
+    return ConversationHandler.END
+
+# Trigger flow
+async def get_trigger_sell_outcome(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     try:
         idx = int(update.message.text.strip())
         if idx not in [0, 1]:
@@ -336,19 +443,19 @@ async def get_sell_outcome_idx(update: Update, context: ContextTypes.DEFAULT_TYP
         await update.message.reply_text(
             f"Selected to SELL: {outcomes[idx]}\n"
             f"Current balance: {balance:.4f} shares\n\n"
-            "4) How much to sell on trigger (% of balance at trigger time):\n"
+            "How much to sell on trigger (% of balance at trigger time):\n"
             "1 = 25%\n2 = 50%\n3 = 100%\nChoice:"
         )
-        return SELL_CHOICE
+        return TRIGGER_SELL_CHOICE
     except:
         await update.message.reply_text("Invalid outcome index (0 or 1).")
-        return SELL_OUTCOME_IDX
+        return TRIGGER_SELL_OUTCOME
 
-async def get_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
+async def get_trigger_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
     ch = update.message.text.strip()
     if ch not in ['1', '2', '3']:
         await update.message.reply_text("Please choose 1, 2, or 3.")
-        return SELL_CHOICE
+        return TRIGGER_SELL_CHOICE
 
     percs = {'1': 0.25, '2': 0.50, '3': 1.00}
     perc = percs[ch]
@@ -360,7 +467,7 @@ async def get_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) ->
 
     await update.message.reply_text(
         f"Will SELL {perc*100:.0f}% ({balance * perc:.4f} shares ≈ ${est_usd}) of {context.user_data['outcome_sell']}\n\n"
-        f"5) Buy opposite outcome ('{context.user_data['outcome_buy']}') on trigger after selling? (y/n)"
+        f"Buy opposite outcome ('{context.user_data['outcome_buy']}') on trigger after selling? (y/n)"
     )
     return AUTO_BUY_YN
 
@@ -415,7 +522,7 @@ async def start_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE) -> i
     context.bot_data['key_index'] = 0
 
     context.application.create_task(monitor_mrbeast_subs(context.application))
-    await update.message.reply_text("🚀 Monitoring started! Updates every ~10 seconds. Will trigger once on first subscriber increase.")
+    await update.message.reply_text("🚀 Monitoring started! Updates every ~2 seconds. Will trigger once on first subscriber increase.")
     return ConversationHandler.END
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
@@ -446,8 +553,13 @@ def main():
         states={
             SLUG: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_slug)],
             MARKET_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_market_idx)],
-            SELL_OUTCOME_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_outcome_idx)],
-            SELL_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_sell_choice)],
+            ACTION_TYPE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_action_type)],
+            NORMAL_BUY_OUTCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, normal_buy_outcome)],
+            NORMAL_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, normal_buy_amount)],
+            NORMAL_SELL_OUTCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, normal_sell_outcome)],
+            NORMAL_SELL_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, normal_sell_choice)],
+            TRIGGER_SELL_OUTCOME: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trigger_sell_outcome)],
+            TRIGGER_SELL_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_trigger_sell_choice)],
             AUTO_BUY_YN: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_auto_buy_yn)],
             AUTO_BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, get_auto_buy_amount)],
             START_MONITOR: [MessageHandler(filters.TEXT & ~filters.COMMAND, start_monitor)],
