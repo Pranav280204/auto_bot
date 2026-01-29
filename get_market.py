@@ -25,8 +25,8 @@ from telegram.request import HTTPXRequest
 load_dotenv()
 
 # Config
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
+PRIVATE_KEY = os.getenv("PRIVATE_KEY")  # This MUST be the EXPORTED private key from Polymarket (Cash > ... > Export Private Key)
+WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")  # Your Polymarket wallet address (the proxy address shown in settings)
 DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
 YOUTUBE_API_KEYS_STR = os.getenv("YOUTUBE_API_KEYS", "")
@@ -61,41 +61,45 @@ ERC1155_ABI = [
 
 w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
 
-# FIXED: Removed signature_type=1 and funder (assuming standard EOA wallet)
+# IMPORTANT: For Magic/email login wallets → signature_type=1 + funder required
+# If you get "invalid signature", try signature_type=2 (some newer proxy wallets use this)
 client = ClobClient(
     host=CLOB_API,
     key=PRIVATE_KEY,
-    chain_id=137
+    chain_id=137,
+    signature_type=1,  # 1 for Magic/POLY_PROXY wallets (most email logins)
+    funder=WALLET_ADDRESS
 )
 
 try:
     creds = client.create_or_derive_api_creds()
     client.set_api_creds(creds)
-    print("API credentials set successfully")
+    print("API credentials derived successfully")
 except Exception as e:
-    print(f"API creds error: {e}")
+    print(f"Failed to derive API creds: {e}")
+    print("Possible causes: Wrong PRIVATE_KEY (must be exported from Polymarket), wrong signature_type, or wallet not supported.")
     exit(1)
 
-# Check allowances (important for real trades)
+# Check allowances (should be unlimited for Magic/proxy wallets)
 try:
     allowances = client.allowances()
-    print(f"Current USDC allowance: {allowances.get('USDC', 0)}")
-    if float(allowances.get('USDC', 0)) < 1000:
-        print("⚠️ USDC allowance is low — approve more USDC via Polymarket UI before trading!")
+    print(f"USDC allowance: {allowances.get('USDC', 'N/A')}")
 except Exception as e:
-    print(f"Failed to fetch allowances: {e}")
+    print(f"Allowance check failed: {e}")
 
-print(f"Connected to Polymarket with wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}")
-print(f"Dry run mode: {DRY_RUN}")
+print(f"Connected to Polymarket | Wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDRESS[-4:]}")
+print(f"Dry run: {DRY_RUN}")
+print("If orders fail with 'invalid signature':")
+print("   • Double-check you exported the correct private key from Polymarket (Cash section > ... > Export Private Key)")
+print("   • Try changing signature_type=2 in the code")
+print("   • Ensure PRIVATE_KEY starts with '0x' and is 66 characters long")
 
-# Conversation states
-SLUG, MARKET_IDX, ACTION_TYPE, NORMAL_BUY_OUTCOME, NORMAL_BUY_AMOUNT, NORMAL_SELL_OUTCOME, NORMAL_SELL_CHOICE, TRIGGER_SELL_OUTCOME, TRIGGER_SELL_CHOICE, AUTO_BUY_YN, AUTO_BUY_AMOUNT, START_MONITOR = range(12)
-
-# ... (fetch_active_markets, get_mid_price, get_balance remain unchanged)
+# Rest of your functions (fetch_active_markets, get_mid_price, get_balance, safe_send_message, etc.)
+# ... (unchanged from your original code)
 
 def place_market_order(token_id, amount, side):
     if DRY_RUN:
-        print(f"[DRY RUN] Would place {side} market order for {amount} on token {token_id}")
+        print(f"[DRY RUN] Would place {side} market order: {amount} on token {token_id}")
         return {"status": "dry_run"}
 
     try:
@@ -107,115 +111,52 @@ def place_market_order(token_id, amount, side):
         )
         signed = client.create_market_order(args)
         resp = client.post_order(signed, OrderType.FOK)
-        print("Order placed successfully:", resp)
+        print("Order successful:", resp)
         return resp
     except Exception as e:
         error_msg = str(e)
-        print(f"Order placement failed: {error_msg}")
+        print(f"Order failed: {error_msg}")
         return {"error": error_msg}
 
-# ... (safe_send_message, get_subscriber_count, monitor_mrbeast_subs remain mostly unchanged, but updated results handling below)
-
+# Monitor function with better error reporting
 async def monitor_mrbeast_subs(application: Application):
-    # ... (unchanged until trigger block)
-    while application.bot_data.get('monitoring', False):
-        # ... (fetch logic unchanged)
-        if not triggered and current_subs > last_subs:
-            triggered = True
-            # ... (timing setup)
-            results = []
-            token_id_sell = application.bot_data.get('token_id_sell')
-            sell_perc = application.bot_data.get('sell_perc', 0)
-            from_outcome = application.bot_data.get('from_outcome')
-
-            # PRIORITY 1: SELL first
-            if sell_perc > 0 and token_id_sell:
-                balance = get_balance(token_id_sell)
-                if balance > 0.01:
-                    sell_amount = balance * sell_perc
-                    sell_start = time.time()
-                    sell_result = place_market_order(token_id_sell, sell_amount, SELL)
-                    sell_dur = time.time() - sell_start
-                    if sell_result and "error" not in sell_result:
-                        results.append(f"✅ SOLD {sell_amount:.4f} shares ({sell_perc*100:.0f}%) of {from_outcome} (took {sell_dur:.3f}s)")
-                    else:
-                        err = sell_result.get("error", "Unknown error") if sell_result else "Unknown error"
-                        results.append(f"❌ SELL failed: {err} (took {sell_dur:.3f}s)")
+    # ... (same as before until trigger)
+    if not triggered and current_subs > last_subs:
+        # ... 
+        results = []
+        # SELL
+        if sell_perc > 0 and token_id_sell:
+            balance = get_balance(token_id_sell)
+            if balance > 0.01:
+                sell_amount = balance * sell_perc
+                sell_start = time.time()
+                sell_result = place_market_order(token_id_sell, sell_amount, SELL)
+                sell_dur = time.time() - sell_start
+                if sell_result and "error" not in sell_result:
+                    results.append(f"✅ SOLD {sell_amount:.4f} shares ({sell_perc*100:.0f}%) of {from_outcome} (took {sell_dur:.3f}s)")
                 else:
-                    results.append("⚠️ No shares to sell.")
+                    err = sell_result.get("error", "Unknown") if isinstance(sell_result, dict) else "Unknown"
+                    results.append(f"❌ SELL failed: {err} (took {sell_dur:.3f}s)")
+            else:
+                results.append("⚠️ No shares to sell.")
+        # BUY
+        if buy_usdc > 0 and token_id_buy:
+            buy_start = time.time()
+            buy_result = place_market_order(token_id_buy, buy_usdc, BUY)
+            buy_dur = time.time() - buy_start
+            if buy_result and "error" not in buy_result:
+                results.append(f"✅ BOUGHT ${buy_usdc:.2f} of {target_outcome} (took {buy_dur:.3f}s)")
+            else:
+                err = buy_result.get("error", "Unknown") if isinstance(buy_result, dict) else "Unknown"
+                results.append(f"❌ BUY failed: {err} (took {buy_dur:.3f}s)")
 
-            # PRIORITY 2: Then BUY opposite
-            buy_usdc = application.bot_data.get('buy_usdc', 0)
-            token_id_buy = application.bot_data.get('token_id_buy')
-            target_outcome = application.bot_data.get('target_outcome')
-            if buy_usdc > 0 and token_id_buy:
-                buy_start = time.time()
-                buy_result = place_market_order(token_id_buy, buy_usdc, BUY)
-                buy_dur = time.time() - buy_start
-                if buy_result and "error" not in buy_result:
-                    results.append(f"✅ BOUGHT ${buy_usdc:.2f} of {target_outcome} (took {buy_dur:.3f}s)")
-                else:
-                    err = buy_result.get("error", "Unknown error") if buy_result else "Unknown error"
-                    results.append(f"❌ BUY failed: {err} (took {buy_dur:.3f}s)")
+        # ... (send message with results)
 
-            # ... (rest of trigger message unchanged)
+# Normal buy/sell with better feedback (same as my previous response)
+# ... (use the versions that check "error" in result and show ✅/❌)
 
-# Telegram handlers (only changed normal buy/sell for proper success/failure reporting)
-
-async def normal_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    try:
-        amount = float(update.message.text.strip())
-        if amount <= 0:
-            raise ValueError
-        token_id = context.user_data['normal_token_id']
-        outcome = context.user_data['normal_outcome']
-        mid = get_mid_price(token_id)
-        est_shares = amount / mid if mid and mid > 0 else "N/A"
-        result = place_market_order(token_id, amount, BUY)
-
-        if DRY_RUN:
-            msg = f"[DRY RUN] Would BUY ${amount:.2f} on {outcome} (≈ {est_shares} shares)"
-        elif result and "error" not in result:
-            msg = f"✅ Normal BUY executed: ${amount:.2f} on {outcome}\nEstimated ≈ {est_shares} shares"
-        else:
-            err = result.get("error", "Unknown error") if result else "Failed to place order"
-            msg = f"❌ BUY failed: {err}\nCheck console logs for details."
-
-        await update.message.reply_text(msg)
-        return ConversationHandler.END
-    except ValueError:
-        await update.message.reply_text("Invalid amount.")
-        return NORMAL_BUY_AMOUNT
-
-async def normal_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE) -> int:
-    ch = update.message.text.strip()
-    if ch not in ['1', '2', '3']:
-        await update.message.reply_text("Please choose 1, 2, or 3.")
-        return NORMAL_SELL_CHOICE
-    percs = {'1': 0.25, '2': 0.50, '3': 1.00}
-    perc = percs[ch]
-    token_id = context.user_data['normal_token_id']
-    outcome = context.user_data['normal_outcome']
-    balance = get_balance(token_id)  # refresh
-    sell_amount = balance * perc
-    mid = get_mid_price(token_id)
-    est_usd = sell_amount * mid if mid else "N/A"
-    result = place_market_order(token_id, sell_amount, SELL)
-
-    if DRY_RUN:
-        msg = f"[DRY RUN] Would SELL {sell_amount:.4f} shares ({perc*100:.0f}%) of {outcome} (≈ ${est_usd})"
-    elif result and "error" not in result:
-        msg = f"✅ Normal SELL executed: {sell_amount:.4f} shares ({perc*100:.0f}%) of {outcome}\n≈ ${est_usd}"
-    else:
-        err = result.get("error", "Unknown error") if result else "Failed to place order"
-        msg = f"❌ SELL failed: {err}\nCheck console logs for details."
-
-    await update.message.reply_text(msg)
-    return ConversationHandler.END
-
-# ... (rest of the handlers and main() unchanged)
+# Keep all handlers the same as your original (or my previous improved version)
 
 if __name__ == "__main__":
-    print("⚠️ REAL TRADING — KEEP DRY_RUN=true UNTIL FULLY TESTED!")
-    print("If you get 'invalid signature' again, ensure your py_clob_client is up to date and USDC allowance is set.")
+    print("⚠️ MAGIC/EMAIL WALLET MODE — Ensure PRIVATE_KEY is correctly exported!")
     main()
