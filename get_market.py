@@ -48,7 +48,7 @@ load_dotenv()
 PRIVATE_KEY = os.getenv("PRIVATE_KEY")
 WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
 TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DRY_RUN = os.getenv("DRY_RUN", "true").lower() == "true"  # default true for safety
+DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"  # default true for safety
 
 if not all([WALLET_ADDRESS, TELEGRAM_BOT_TOKEN]):
     raise ValueError("Set WALLET_ADDRESS and TELEGRAM_BOT_TOKEN in environment (PRIVATE_KEY optional for dry run).")
