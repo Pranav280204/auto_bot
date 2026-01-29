@@ -1,29 +1,3 @@
-"""
-Polymarket CLI trading bot (Python)
-
-Usage:
-  1) Install dependencies:
-       pip install py-clob-client requests python-dotenv
-  2) Export env vars (recommended):
-       export PRIVATE_KEY="<your-private-key>"
-       export WALLET_ADDRESS="0x..."
-       export POLYMARKET_PROXY_ADDRESS="<optional proxy funder address>"
-       export SIGNATURE_TYPE="1"  # 1=Magic/email proxy, 2=browser wallet, 3=EOA (default 1)
-  3) Run:
-       python polymarket_trading_bot.py
-
-Security:
-  - Never paste your private key into chat. Use environment variables or a secure secrets manager.
-  - This script uses your private key only to derive API credentials locally (per Polymarket docs).
-
-What this script does:
-  1) Ask for an event slug (e.g. "will-bitcoin-reach-100k-by-2025")
-  2) Fetch market info from Polymarket's Gamma API and show available outcomes / token IDs
-  3) Let you choose outcome, buy/sell, price & size, confirm, then place an order via the CLOB Python client
-
-This is a minimal example intended for educational use. Test on small amounts first.
-"""
-
 import os
 import sys
 import json
