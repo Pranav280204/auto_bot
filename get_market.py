@@ -47,7 +47,7 @@ CLOB_API = "https://clob.polymarket.com"
 POLYGON_RPC = "https://polygon-rpc.com/"
 CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
 CHANNEL_ID = "UCX6OQ3DkcsbYNE6H8uQQuVA"  # MrBeast
-CHECK_INTERVAL = 10  # seconds
+CHECK_INTERVAL = 2  # seconds
 
 ERC1155_ABI = [
     {
