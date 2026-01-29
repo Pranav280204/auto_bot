@@ -1,176 +1,191 @@
+"""
+Polymarket CLI trading bot (Python)
+
+Usage:
+  1) Install dependencies:
+       pip install py-clob-client requests python-dotenv
+  2) Export env vars (recommended):
+       export PRIVATE_KEY="<your-private-key>"
+       export WALLET_ADDRESS="0x..."
+       export POLYMARKET_PROXY_ADDRESS="<optional proxy funder address>"
+       export SIGNATURE_TYPE="1"  # 1=Magic/email proxy, 2=browser wallet, 3=EOA (default 1)
+  3) Run:
+       python polymarket_trading_bot.py
+
+Security:
+  - Never paste your private key into chat. Use environment variables or a secure secrets manager.
+  - This script uses your private key only to derive API credentials locally (per Polymarket docs).
+
+What this script does:
+  1) Ask for an event slug (e.g. "will-bitcoin-reach-100k-by-2025")
+  2) Fetch market info from Polymarket's Gamma API and show available outcomes / token IDs
+  3) Let you choose outcome, buy/sell, price & size, confirm, then place an order via the CLOB Python client
+
+This is a minimal example intended for educational use. Test on small amounts first.
+"""
+
 import os
+import sys
 import json
+import getpass
 import requests
-from dotenv import load_dotenv
-from web3 import Web3
-from eth_account import Account
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
-
-load_dotenv()
-
-# === CONFIG ===
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
-
-if not PRIVATE_KEY or not WALLET_ADDRESS:
-    print("ERROR: Set PRIVATE_KEY and WALLET_ADDRESS in .env")
-    exit(1)
-
-GAMMA_API = "https://gamma-api.polymarket.com"
-CLOB_API = "https://clob.polymarket.com"
-POLYGON_RPC = "https://polygon-rpc.com/"
-CONDITIONAL_TOKENS = "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045"
-
-# === DEBUG INFO (no mismatch check) ===
-print("=== DEBUG INFO ===")
-print(f"PRIVATE_KEY (truncated): {PRIVATE_KEY[:10]}...{PRIVATE_KEY[-6:]}")
-print(f"WALLET_ADDRESS: {WALLET_ADDRESS}")
+from pprint import pprint
 
 try:
-    acct = Account.from_key(PRIVATE_KEY)
-    derived = acct.address.lower()
-    print(f"Derived address from key: {derived}")
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs, OrderType
+    from py_clob_client.order_builder.constants import BUY, SELL
 except Exception as e:
-    print(f"Invalid PRIVATE_KEY: {e}")
-    exit(1)
+    print("Missing dependencies. Run: pip install py-clob-client requests python-dotenv")
+    raise
 
-# === Init client ===
-client = ClobClient(
-    host=CLOB_API,
-    key=PRIVATE_KEY,
-    chain_id=137,
-    signature_type=1,  # Magic Link / POLY_PROXY
-    funder=WALLET_ADDRESS
-)
+GAMMA_API_BASE = "https://gamma-api.polymarket.com"
+CLOB_HOST = "https://clob.polymarket.com"
+CHAIN_ID = 137  # Polygon
 
-try:
-    creds = client.create_or_derive_api_creds()
-    client.set_api_creds(creds)
-    print("API credentials derived and set successfully!")
-except Exception as e:
-    print(f"Creds derivation failed: {e}")
-    exit(1)
 
-print(f"Dry run mode: {DRY_RUN}\n")
+def get_env_or_prompt(name, secret=False):
+    val = os.getenv(name)
+    if val:
+        return val
+    if secret:
+        return getpass.getpass(f"Enter {name}: ")
+    return input(f"Enter {name}: ")
 
-# === Helper functions ===
-def fetch_active_markets(slug):
-    url = f"{GAMMA_API}/events/slug/{slug}"
-    try:
-        resp = requests.get(url)
-        resp.raise_for_status()
-        data = resp.json()
-        markets = data.get("markets", [])
-        return [m for m in markets if m.get("active", False) and not m.get("closed", True)]
-    except Exception as e:
-        print(f"Error fetching markets: {e}")
-        return []
 
-def get_mid_price(token_id):
-    try:
-        book = client.get_order_book(token_id)
-        bids = [float(p) for p, _ in book.get("bids", [])]
-        asks = [float(p) for p, _ in book.get("asks", [])]
-        if bids and asks:
-            return (max(bids) + min(asks)) / 2
-        return max(bids) if bids else (min(asks) if asks else None)
-    except Exception as e:
-        print(f"Orderbook error: {e}")
+def fetch_market_by_slug(slug):
+    url = f"{GAMMA_API_BASE}/markets/slug/{slug}"
+    resp = requests.get(url)
+    if resp.status_code != 200:
+        print(f"Error fetching market: {resp.status_code} {resp.text}")
         return None
+    return resp.json()
 
-def get_balance(token_id):
-    w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-    abi = [{"inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}], "name": "balanceOf", "outputs": [{"name": "", "type": "uint256"}], "stateMutability": "view", "type": "function"}]
-    contract = w3.eth.contract(address=w3.to_checksum_address(CONDITIONAL_TOKENS), abi=abi)
+
+def choose_from_list(prompt, items):
+    for i, it in enumerate(items):
+        print(f"[{i}] {it}")
+    idx = input(prompt)
     try:
-        bal = contract.functions.balanceOf(w3.to_checksum_address(WALLET_ADDRESS), int(token_id)).call()
-        return bal / 1_000_000
-    except Exception as e:
-        print(f"Balance error: {e}")
-        return 0.0
+        idx = int(idx)
+        if 0 <= idx < len(items):
+            return idx
+    except:
+        pass
+    print("Invalid selection")
+    return None
 
-def place_market_order(token_id, amount, side):
-    if DRY_RUN:
-        print(f"[DRY RUN] Would {side} {amount} on token {token_id}")
-        return
-    try:
-        args = MarketOrderArgs(token_id=token_id, amount=amount, side=side, order_type=OrderType.FOK)
-        signed = client.create_market_order(args)
-        resp = client.post_order(signed, OrderType.FOK)
-        print("Order placed successfully!")
-        print("Response:", resp)
-    except Exception as e:
-        print(f"ORDER PLACEMENT FAILED: {e}")
-        import traceback
-        traceback.print_exc()
 
-# === Main flow ===
-print("=== Polymarket Simple Buy/Sell Test ===\n")
+def main():
+    print("Polymarket CLI trading bot — minimal example")
 
-slug = input("1) Enter event slug: ").strip()
-markets = fetch_active_markets(slug)
+    # Read credentials securely
+    private_key = os.getenv("PRIVATE_KEY")
+    if not private_key:
+        print("PRIVATE_KEY not set in environment. You can paste it now (it will not be echoed).")
+        private_key = getpass.getpass("Private key: ")
 
-if not markets:
-    print("No active markets found for this slug.")
-    exit(1)
+    wallet_address = os.getenv("WALLET_ADDRESS") or input("Your wallet address (0x...): ")
 
-print(f"\nFound {len(markets)} active market(s):")
-for i, m in enumerate(markets):
-    print(f"{i}: {m.get('question', 'Unknown')}")
+    signature_type_env = os.getenv("SIGNATURE_TYPE")
+    signature_type = int(signature_type_env) if signature_type_env else 1
+    funder = os.getenv("POLYMARKET_PROXY_ADDRESS") or None
 
-market_idx = int(input("\n2) Select market number: "))
-market = markets[market_idx]
+    # Initialize client
+    client_args = dict(host=CLOB_HOST, key=private_key, chain_id=CHAIN_ID)
+    if signature_type in (1, 2):
+        client_args.update({"signature_type": signature_type})
+        if signature_type == 1 and funder:
+            client_args["funder"] = funder
 
-outcomes = market.get("outcomes", [])
-if isinstance(outcomes, str):
-    outcomes = json.loads(outcomes)
-token_ids = market.get("clobTokenIds", [])
-if isinstance(token_ids, str):
-    token_ids = json.loads(token_ids)
+    client = ClobClient(**client_args)
 
-print("\nOutcomes:")
-for i, (outcome, tid) in enumerate(zip(outcomes, token_ids)):
-    mid = get_mid_price(tid) or "N/A"
-    bal = get_balance(tid)
-    print(f"{i}: {outcome} | Mid price: {mid:.4f if isinstance(mid, float) else mid} | Your balance: {bal:.4f} shares")
+    # Derive API creds (one-time; safe to run every start)
+    print("Deriving API credentials (private key used locally to derive API key)...")
+    api_creds = client.create_or_derive_api_creds()
+    client.set_api_creds(api_creds)
+    print("API credentials derived. API key:", api_creds.get("apiKey"))
 
-outcome_idx = int(input("\n3) Select outcome number: "))
-token_id = token_ids[outcome_idx]
-outcome_name = outcomes[outcome_idx]
-mid = get_mid_price(token_id) or 0.5
+    # 1) Get event/market
+    slug = input("Enter event market slug (e.g. will-bitcoin-reach-100k-by-2025): ").strip()
+    market = fetch_market_by_slug(slug)
+    if not market:
+        print("Market not found — exiting.")
+        sys.exit(1)
 
-print(f"\nSelected: {outcome_name} (token_id: {token_id})")
+    print("Market fetched — some fields:")
+    # Print condensed view
+    # clobTokenIds usually contains token IDs for outcomes
+    clob_token_ids = market.get("clobTokenIds") or market.get("clob_token_ids")
+    outcomes = market.get("outcomes") or market.get("labels") or market.get("outcome_labels")
 
-action = input("4) Buy or Sell? (b/s): ").strip().lower()
-if action not in ['b', 's']:
-    print("Invalid action.")
-    exit(1)
+    if outcomes and isinstance(outcomes, list):
+        for i, o in enumerate(outcomes):
+            # flexible handling: outcome may be string or dict
+            if isinstance(o, dict):
+                label = o.get("label") or o.get("name") or json.dumps(o)
+            else:
+                label = str(o)
+            token_id = clob_token_ids[i] if clob_token_ids and i < len(clob_token_ids) else "<unknown_token_id>"
+            print(f"[{i}] {label} — token_id: {token_id}")
+    elif clob_token_ids:
+        for i, tid in enumerate(clob_token_ids):
+            print(f"[{i}] token_id: {tid}")
+    else:
+        print("Could not find outcome labels or clobTokenIds in the market response — raw JSON:")
+        pprint(market)
+        print("Please copy the token id you want to trade from the raw output above and enter it manually.")
 
-side = BUY if action == 'b' else SELL
-side_name = "BUY" if action == 'b' else "SELL"
+    # Choose outcome
+    if clob_token_ids:
+        idx = choose_from_list("Select outcome index: ", [str(t) for t in clob_token_ids])
+        token_id = clob_token_ids[idx]
+    else:
+        token_id = input("Enter token id to trade: ").strip()
 
-if action == 'b':
-    amount = float(input(f"Enter USDC amount to {side_name}: "))
-    est_shares = amount / mid if mid > 0 else "?"
-    print(f"Estimated shares: {est_shares}")
-else:
-    bal = get_balance(token_id)
-    print(f"Current balance: {bal:.4f} shares")
-    amount = float(input(f"Enter shares to {side_name} (max {bal:.4f}): "))
-    if amount > bal:
-        print("Not enough shares!")
-        exit(1)
-    est_usdc = amount * mid
-    print(f"Estimated USDC: ${est_usdc:.2f}")
+    # Choose buy or sell
+    side = input("Enter side (buy/sell): ").strip().lower()
+    if side not in ("buy", "sell"):
+        print("Invalid side")
+        sys.exit(1)
+    side_const = BUY if side == "buy" else SELL
 
-confirm = input(f"\nConfirm {side_name} {amount} on {outcome_name}? (y/n): ")
-if confirm.lower() != 'y':
-    print("Cancelled.")
-    exit(1)
+    # Enter price and size
+    price = float(input("Enter price (0.00 - 1.00): ").strip())
+    size = float(input("Enter size (number of shares or dollar amount depending on order type): ").strip())
 
-print("\nPlacing order...")
-place_market_order(token_id, str(amount), side)
-print("Done!")
+    # Choose order type
+    print("Order types: [0] GTC (Good-Till-Cancelled), [1] FOK (Fill-Or-Kill), [2] FAK")
+    ot = input("Select order type index (default 0): ").strip()
+    order_type = OrderType.GTC
+    if ot == "1":
+        order_type = OrderType.FOK
+    elif ot == "2":
+        order_type = OrderType.FAK
+
+    # Confirm
+    print("Summary:")
+    print(f"Market slug: {slug}")
+    print(f"Token ID: {token_id}")
+    print(f"Side: {side}")
+    print(f"Price: {price}")
+    print(f"Size: {size}")
+    print(f"Order type: {order_type}")
+    confirm = input("Type YES to confirm and place order: ").strip()
+    if confirm != "YES":
+        print("Order cancelled by user")
+        sys.exit(0)
+
+    # Build and sign order
+    order_args = OrderArgs(price=price, size=size, side=side_const, token_id=token_id)
+    signed_order = client.create_order(order_args)
+
+    # Post order
+    print("Placing order...")
+    resp = client.post_order(signed_order, order_type)
+    print("Response from Polymarket:")
+    pprint(resp)
+
+
+if __name__ == '__main__':
+    main()
