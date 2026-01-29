@@ -250,7 +250,7 @@ async def monitor_mrbeast_subs(application: Application):
                 if results:
                     trigger_msg += "\n".join(results)
                 else:
-                    trigger_msg += destas "No actions performed."
+                    trigger_msg += "No actions performed."
 
                 await safe_send_message(application.bot, chat_id, trigger_msg)
                 await safe_send_message(application.bot, chat_id, "Monitoring stopped after trigger.")
@@ -363,7 +363,7 @@ async def normal_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE) 
         token_id = context.user_data['normal_token_id']
         outcome = context.user_data['normal_outcome']
         mid = get_mid_price(token_id)
-        est_shares = amount / mid if mid and mid > 0 else "?"
+        est_shares = amount / mid if mid and mid > 0 else "N/A"
         result = place_market_order(token_id, amount, BUY)
         msg = f"✅ Normal BUY executed: ${amount:.2f} on {outcome}\nEstimated ≈ {est_shares} shares"
         if DRY_RUN:
@@ -410,7 +410,7 @@ async def normal_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE)
     balance = get_balance(token_id)  # refresh balance
     sell_amount = balance * perc
     mid = get_mid_price(token_id)
-    est_usd = sell_amount * mid if mid else "?"
+    est_usd = sell_amount * mid if mid else "N/A"
 
     result = place_market_order(token_id, sell_amount, SELL)
     msg = f"✅ Normal SELL executed: {sell_amount:.4f} shares ({perc*100:.0f}%) of {outcome}\n≈ ${est_usd}"
@@ -463,7 +463,7 @@ async def get_trigger_sell_choice(update: Update, context: ContextTypes.DEFAULT_
 
     balance = context.user_data['current_balance']
     mid = get_mid_price(context.user_data['token_id_sell'])
-    est_usd = balance * perc * mid if mid else "?"
+    est_usd = balance * perc * mid if mid else "N/A"
 
     await update.message.reply_text(
         f"Will SELL {perc*100:.0f}% ({balance * perc:.4f} shares ≈ ${est_usd}) of {context.user_data['outcome_sell']}\n\n"
