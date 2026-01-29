@@ -64,7 +64,7 @@ client = ClobClient(
     host=CLOB_API,
     key=PRIVATE_KEY,
     chain_id=137,
-    signature_type=1,
+    signature_type=0,
     funder=WALLET_ADDRESS
 )
 
