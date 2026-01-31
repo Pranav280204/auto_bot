@@ -235,23 +235,48 @@ async def monitor_youtube_and_trigger(application: Application):
                     changed = True
 
                     token_sell = application.bot_data.get("token_id_sell")
-                    sell_shares = application.bot_data.get("sell_shares", 0)
+                    configured_sell = application.bot_data.get("sell_shares", 0)
+                    sell_percent = application.bot_data.get("sell_percent", None)
                     token_buy = application.bot_data.get("token_id_buy")
                     buy_usdc = application.bot_data.get("buy_usdc", 0)
 
-                    # SELL first
-                    if sell_shares > 0 and token_sell:
-                        t0 = time.time()
-                        resp = place_market_order(token_sell, sell_shares, SELL)
-                        took = time.time() - t0
-                        trade_log.append(f"SELL {sell_shares:.6f} shares (took {took:.3f}s) | resp={resp}")
+                    # prevent concurrent trades
+                    in_trade = application.bot_data.get("in_trade", False)
+                    if in_trade:
+                        trade_log.append("Skipped trade: another trade is in progress")
+                    else:
+                        application.bot_data["in_trade"] = True
+                        try:
+                            # SELL first (re-check balance at trigger time)
+                            if token_sell:
+                                current_bal = get_balance_shares(token_sell)
 
-                    # BUY after sell
-                    if buy_usdc > 0 and token_buy:
-                        t0 = time.time()
-                        resp = place_market_order(token_buy, buy_usdc, BUY)
-                        took = time.time() - t0
-                        trade_log.append(f"BUY ${buy_usdc:.2f} YES (took {took:.3f}s) | resp={resp}")
+                                # if a percent was chosen earlier, compute configured_sell from current balance
+                                if sell_percent is not None:
+                                    configured_sell = current_bal * float(sell_percent)
+
+                                # decide actual sell amount = min(configured, current)
+                                sell_to_place = min(configured_sell, current_bal)
+
+                                if sell_to_place <= 1e-9:
+                                    trade_log.append(f"SKIPPED SELL: configured {configured_sell:.6f} but current balance is {current_bal:.6f}")
+                                else:
+                                    if sell_to_place < configured_sell - 1e-9:
+                                        trade_log.append(f"Adjusted SELL from {configured_sell:.6f} to available {sell_to_place:.6f} shares")
+                                    t0 = time.time()
+                                    resp = await asyncio.to_thread(place_market_order, token_sell, sell_to_place, SELL)
+                                    took = time.time() - t0
+                                    trade_log.append(f"SELL {sell_to_place:.6f} shares (took {took:.3f}s) | resp={resp}")
+
+                            # BUY after sell
+                            if buy_usdc > 0 and token_buy:
+                                t0 = time.time()
+                                resp = await asyncio.to_thread(place_market_order, token_buy, buy_usdc, BUY)
+                                took = time.time() - t0
+                                trade_log.append(f"BUY ${buy_usdc:.2f} YES (took {took:.3f}s) | resp={resp}")
+
+                        finally:
+                            application.bot_data["in_trade"] = False
 
                     last_subs = subs
 
@@ -405,9 +430,9 @@ async def got_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bal = context.user_data.get('balance', 0.0)
     if ch in ('1', '2', '3'):
         per = {'1': 0.25, '2': 0.5, '3': 1.0}[ch]
-        sell_shares = bal * per
-        context.user_data['sell_shares'] = sell_shares
-        await update.message.reply_text(f"Will SELL {sell_shares:.6f} shares on trigger.\nAfter selling, do you want to BUY YES on trigger? (y/n)")
+        # store percent and compute final amount at trigger time from current balance
+        context.user_data['sell_percent'] = per
+        await update.message.reply_text(f"Will SELL {int(per*100)}% on trigger (calculated from current balance at trigger time).\nAfter selling, do you want to BUY YES on trigger? (y/n)")
         return BUY_AFTER_YN
     elif ch == '4':
         await update.message.reply_text("Enter CUSTOM shares to sell on trigger (numeric):")
@@ -459,7 +484,10 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
     user = context.user_data
     # token to sell is the selected outcome token
     app.bot_data['token_id_sell'] = user.get('token_id')
+    # store both absolute sell_shares (if custom) and optional sell_percent
     app.bot_data['sell_shares'] = user.get('sell_shares', 0.0)
+    if 'sell_percent' in user:
+        app.bot_data['sell_percent'] = user['sell_percent']
     # buy target: prefer YES outcome (0) if present, otherwise same
     outcomes = user.get('outcomes', [])
     token_ids = user.get('token_ids', [])
