@@ -191,7 +191,7 @@ async def monitor_youtube_and_trigger(application: Application):
     print("YouTube monitor: started")
 
     rotator = YTKeyRotator(application.bot_data.get("yt_api_keys", []))
-    channel_id = application.bot_data.get("yt_channel_id")
+    channel_id = application.bot_data.get("YOUTUBE_CHANNEL_ID")
     chat_id = application.bot_data.get("chat_id")
 
     last_subs = None
@@ -330,7 +330,7 @@ async def check_latest_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fetch the latest subscriber count using configured YT API keys and reply in chat."""
     app = context.application
     keys = app.bot_data.get("yt_api_keys", []) or YT_API_KEYS
-    channel_id = app.bot_data.get("yt_channel_id", YT_CHANNEL_ID)
+    channel_id = app.bot_data.get("YOUTUBE_CHANNEL_ID", YOUTUBE_CHANNEL_ID)
 
     if not keys:
         await update.message.reply_text("No YouTube API keys configured (set YOUTUBE_API_KEYS in env).")
@@ -572,7 +572,7 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
     app.bot_data["chat_id"] = update.effective_chat.id
     app.bot_data["yt_monitoring"] = True
     app.bot_data["yt_api_keys"] = YT_API_KEYS
-    app.bot_data["yt_channel_id"] = YT_CHANNEL_ID
+    app.bot_data["YOUTUBE_CHANNEL_ID"] = YOUTUBE_CHANNEL_ID
 
     # start background monitoring task
     app.create_task(monitor_youtube_and_trigger(app))
@@ -660,7 +660,7 @@ def main():
 
     # persist some bot_data defaults
     app.bot_data["yt_api_keys"] = YT_API_KEYS
-    app.bot_data["yt_channel_id"] = YT_CHANNEL_ID
+    app.bot_data["YOUTUBE_CHANNEL_ID"] = YOUTUBE_CHANNEL_ID
 
     print("Bot running. Use /start. DRY_RUN =", DRY_RUN)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
