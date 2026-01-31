@@ -39,7 +39,7 @@ CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87
 # YouTube monitoring
 # Provide comma-separated YouTube API keys in env: YOUTUBE_API_KEYS="key1,key2,..."
 YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
-YT_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCX6OQ3DkcsbYNE6H8uQQuVA")  # default: MrBeast's channel id
+YT_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID", "UCmoPifVJSUf7HlNSCv8kkiw")  # default: MrBeast's channel id
 POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL", "1"))  # backend polling interval (seconds)
 TELEGRAM_HEARTBEAT = float(os.getenv("YT_HEARTBEAT", "10"))  # how often to send Telegram messages (seconds)
 
