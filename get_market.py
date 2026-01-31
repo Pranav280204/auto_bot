@@ -40,7 +40,7 @@ CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87
 # Provide comma-separated YouTube API keys in env: YOUTUBE_API_KEYS="key1,key2,..."
 YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
 YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")
-POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL", "1"))  # backend polling interval (seconds)
+POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL"))  # backend polling interval (seconds)
 TELEGRAM_HEARTBEAT = float(os.getenv("YT_HEARTBEAT", "10"))  # how often to send Telegram messages (seconds)
 
 if not TELEGRAM_BOT_TOKEN:
