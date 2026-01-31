@@ -146,7 +146,8 @@ def place_market_order(token_id, amount, side):
         return resp
     except Exception as e:
         print("place_market_order error:", e)
-        return None
+        return {"error": str(e)}
+
 
 # ---------- YouTube helper (round-robin keys) ----------
 class YTKeyRotator:
@@ -179,6 +180,7 @@ async def fetch_channel_subs(session: aiohttp.ClientSession, api_key: str, chann
             return {"subs": subs}
     except Exception as e:
         return {"error": str(e)}
+
 
 # ---------- Monitoring coroutine ----------
 async def monitor_youtube_and_trigger(application: Application):
@@ -259,10 +261,14 @@ async def monitor_youtube_and_trigger(application: Application):
                                 sell_to_place = min(configured_sell, current_bal)
 
                                 if sell_to_place <= 1e-9:
-                                    trade_log.append(f"SKIPPED SELL: configured {configured_sell:.6f} but current balance is {current_bal:.6f}")
+                                    trade_log.append(
+                                        f"SKIPPED SELL: configured {configured_sell:.6f} but current balance is {current_bal:.6f}"
+                                    )
                                 else:
                                     if sell_to_place < configured_sell - 1e-9:
-                                        trade_log.append(f"Adjusted SELL from {configured_sell:.6f} to available {sell_to_place:.6f} shares")
+                                        trade_log.append(
+                                            f"Adjusted SELL from {configured_sell:.6f} to available {sell_to_place:.6f} shares"
+                                        )
                                     t0 = time.time()
                                     resp = await asyncio.to_thread(place_market_order, token_sell, sell_to_place, SELL)
                                     took = time.time() - t0
@@ -288,26 +294,22 @@ async def monitor_youtube_and_trigger(application: Application):
             if should_send:
                 # Build message including any trades that happened since last message
                 msg_lines = [
-                    f"📊 **MrBeast Subscriber Monitor**",
+                    "📊 **MrBeast Subscriber Monitor**",
                     f"Time: {now.strftime('%H:%M:%S')} UTC",
                     f"Subscribers: {subs:,}",
                 ]
 
                 if trade_log:
-                    msg_lines.append("
-🚨 **TRADES EXECUTED SINCE LAST UPDATE**")
+                    msg_lines.append("\n🚨 **TRADES EXECUTED SINCE LAST UPDATE**")
                     msg_lines.extend(trade_log)
                     trade_log.clear()
                 else:
                     if changed:
-                        msg_lines.append("
-✅ Change detected but no trades configured.")
+                        msg_lines.append("\n✅ Change detected but no trades configured.")
                     else:
-                        msg_lines.append("
-No change detected.")
+                        msg_lines.append("\nNo change detected.")
 
-                msg_text = "
-".join(msg_lines)
+                msg_text = "\n".join(msg_lines)
 
                 try:
                     await application.bot.send_message(chat_id=chat_id, text=msg_text)
@@ -327,8 +329,8 @@ No change detected.")
 async def check_latest_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
     """Fetch the latest subscriber count using configured YT API keys and reply in chat."""
     app = context.application
-    keys = app.bot_data.get('yt_api_keys', []) or YT_API_KEYS
-    channel_id = app.bot_data.get('yt_channel_id', YT_CHANNEL_ID)
+    keys = app.bot_data.get("yt_api_keys", []) or YT_API_KEYS
+    channel_id = app.bot_data.get("yt_channel_id", YT_CHANNEL_ID)
 
     if not keys:
         await update.message.reply_text("No YouTube API keys configured (set YOUTUBE_API_KEYS in env).")
@@ -342,11 +344,11 @@ async def check_latest_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
             if not key:
                 break
             res = await fetch_channel_subs(session, key, channel_id)
-            if 'subs' in res:
-                ts = datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S UTC')
+            if "subs" in res:
+                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
                 await update.message.reply_text(f"Latest subscribers: {res['subs']:,} (fetched at {ts})")
                 return
-            last_err = res.get('error') if isinstance(res, dict) else str(res)
+            last_err = res.get("error") if isinstance(res, dict) else str(res)
 
     await update.message.reply_text(f"Failed to fetch subscribers. Last error: {last_err}")
 
@@ -356,116 +358,109 @@ async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enter Polymarket event slug:")
     return SLUG
 
+
 async def got_slug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slug = update.message.text.strip()
     markets = fetch_active_markets(slug)
     if not markets:
         await update.message.reply_text("No active markets found.")
         return ConversationHandler.END
-    context.user_data['slug'] = slug
-    context.user_data['markets'] = markets
-    text = f"Found {len(markets)} active market(s):
-"
+    context.user_data["slug"] = slug
+    context.user_data["markets"] = markets
+    text = f"Found {len(markets)} active market(s):\n"
     for i, m in enumerate(markets):
-        text += f"{i}: {m.get('question', 'Unknown')}
-"
-    text += "
-Select market number:"
+        text += f"{i}: {m.get('question', 'Unknown')}\n"
+    text += "\nSelect market number:"
     await update.message.reply_text(text)
     return MARKET_IDX
+
 
 async def got_market_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         idx = int(update.message.text.strip())
-        markets = context.user_data['markets']
+        markets = context.user_data["markets"]
         market = markets[idx]
         outcomes, token_ids = normalize_outcomes_and_token_ids(market)
         if not outcomes or not token_ids:
             await update.message.reply_text("Market missing outcomes or token ids.")
             return ConversationHandler.END
-        context.user_data['market'] = market
-        context.user_data['outcomes'] = outcomes
-        context.user_data['token_ids'] = token_ids
+        context.user_data["market"] = market
+        context.user_data["outcomes"] = outcomes
+        context.user_data["token_ids"] = token_ids
 
         # After selecting market, ask normal / trigger choice
         await update.message.reply_text(
-            "Choose action:
-1 = Normal Buy
-2 = Normal Sell
-3 = Trigger action (YouTube subscriber change)"
+            "Choose action:\n1 = Normal Buy\n2 = Normal Sell\n3 = Trigger action (YouTube subscriber change)"
         )
         return MODE_CHOICE
     except Exception:
         await update.message.reply_text("Invalid market index.")
         return MARKET_IDX
 
+
 async def got_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ch = update.message.text.strip()
     if ch not in ("1", "2", "3"):
         await update.message.reply_text("Choose 1, 2 or 3.")
         return MODE_CHOICE
-    context.user_data['mode'] = ch
+    context.user_data["mode"] = ch
     # Ask outcome:
-    outcomes = context.user_data['outcomes']
-    text = "Select outcome number:
-"
+    outcomes = context.user_data["outcomes"]
+    text = "Select outcome number:\n"
     for i, o in enumerate(outcomes):
-        text += f"{i}: {o}
-"
+        text += f"{i}: {o}\n"
     await update.message.reply_text(text)
     return OUTCOME_IDX
+
 
 async def got_outcome_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         idx = int(update.message.text.strip())
-        outcomes = context.user_data['outcomes']
-        token_ids = context.user_data['token_ids']
+        outcomes = context.user_data["outcomes"]
+        token_ids = context.user_data["token_ids"]
         outcome = outcomes[idx]
         token_id = token_ids[idx]
-        context.user_data['outcome'] = outcome
-        context.user_data['token_id'] = token_id
+        context.user_data["outcome"] = outcome
+        context.user_data["token_id"] = token_id
 
         mid = get_mid_price(token_id)
         mid_str = f"{mid:.6f}" if mid else "N/A"
-        mode = context.user_data['mode']
+        mode = context.user_data["mode"]
 
         if mode == "1":  # Normal Buy
-            await update.message.reply_text(f"Normal BUY selected. Outcome: {outcome} | Mid: {mid_str}
-Enter USDC amount to BUY:")
-            context.user_data['normal_action'] = 'buy'
+            await update.message.reply_text(
+                f"Normal BUY selected. Outcome: {outcome} | Mid: {mid_str}\nEnter USDC amount to BUY:"
+            )
+            context.user_data["normal_action"] = "buy"
             return AMOUNT
         elif mode == "2":  # Normal Sell
             # check balance
             bal = get_balance_shares(token_id)
-            context.user_data['balance'] = bal
-            await update.message.reply_text(f"Normal SELL selected. Outcome: {outcome} | Your balance: {bal:.6f} shares
-Enter shares to SELL (or type 25/50/100 for percent):")
-            context.user_data['normal_action'] = 'sell'
+            context.user_data["balance"] = bal
+            await update.message.reply_text(
+                f"Normal SELL selected. Outcome: {outcome} | Your balance: {bal:.6f} shares\nEnter shares to SELL (or type 25/50/100 for percent):"
+            )
+            context.user_data["normal_action"] = "sell"
             return AMOUNT
         else:
             # Trigger flow: ask whether to sell on trigger or buy
-            await update.message.reply_text("Trigger action selected.
-Do you want to SELL on subscriber change? (y/n)")
+            await update.message.reply_text("Trigger action selected.\nDo you want to SELL on subscriber change? (y/n)")
             return ACTION
     except Exception:
         await update.message.reply_text("Invalid outcome index.")
         return OUTCOME_IDX
 
+
 async def got_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # Used only in trigger flow: decide if SELL on trigger
     text = update.message.text.strip().lower()
-    if text.startswith('y'):
+    if text.startswith("y"):
         # SELL on trigger — ask percent to sell
-        token_id = context.user_data['token_id']
+        token_id = context.user_data["token_id"]
         bal = get_balance_shares(token_id)
-        context.user_data['balance'] = bal
+        context.user_data["balance"] = bal
         await update.message.reply_text(
-            f"You have {bal:.6f} shares on this outcome.
-Choose percent to SELL on trigger:
-1=25%
-2=50%
-3=100%
-4=custom (enter shares)"
+            f"You have {bal:.6f} shares on this outcome.\nChoose percent to SELL on trigger:\n1=25%\n2=50%\n3=100%\n4=custom (enter shares)"
         )
         return SELL_CHOICE
     else:
@@ -473,42 +468,47 @@ Choose percent to SELL on trigger:
         await update.message.reply_text("Do you want to BUY YES on trigger when subscriber count changes? (y/n)")
         return BUY_AFTER_YN
 
+
 async def got_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
     ch = update.message.text.strip()
-    bal = context.user_data.get('balance', 0.0)
-    if ch in ('1', '2', '3'):
-        per = {'1': 0.25, '2': 0.5, '3': 1.0}[ch]
+    bal = context.user_data.get("balance", 0.0)
+    if ch in ("1", "2", "3"):
+        per = {"1": 0.25, "2": 0.5, "3": 1.0}[ch]
         # store percent and compute final amount at trigger time from current balance
-        context.user_data['sell_percent'] = per
-        await update.message.reply_text(f"Will SELL {int(per*100)}% on trigger (calculated from current balance at trigger time).
-After selling, do you want to BUY YES on trigger? (y/n)")
+        context.user_data["sell_percent"] = per
+        await update.message.reply_text(
+            f"Will SELL {int(per*100)}% on trigger (calculated from current balance at trigger time).\nAfter selling, do you want to BUY YES on trigger? (y/n)"
+        )
         return BUY_AFTER_YN
-    elif ch == '4':
+    elif ch == "4":
         await update.message.reply_text("Enter CUSTOM shares to sell on trigger (numeric):")
         return CONFIRM  # we'll reuse CONFIRM to accept numeric custom shares
     else:
         await update.message.reply_text("Invalid choice.")
         return SELL_CHOICE
 
+
 async def got_confirm_custom_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # CONFIRM used to accept custom sell shares value in trigger flow before buy question
     try:
         val = float(update.message.text.strip())
-        bal = context.user_data.get('balance', 0.0)
+        bal = context.user_data.get("balance", 0.0)
         if val <= 0 or val > bal:
             await update.message.reply_text("Invalid shares (must be >0 and <= balance). Enter again:")
             return CONFIRM
-        context.user_data['sell_shares'] = val
-        await update.message.reply_text(f"Will SELL {val:.6f} shares on trigger.
-After selling, do you want to BUY YES on trigger? (y/n)")
+        context.user_data["sell_shares"] = val
+        await update.message.reply_text(
+            f"Will SELL {val:.6f} shares on trigger.\nAfter selling, do you want to BUY YES on trigger? (y/n)"
+        )
         return BUY_AFTER_YN
     except Exception:
         await update.message.reply_text("Invalid numeric input. Enter shares as a number:")
         return CONFIRM
 
+
 async def got_buy_after_yn(update: Update, context: ContextTypes.DEFAULT_TYPE):
     txt = update.message.text.strip().lower()
-    if txt.startswith('y'):
+    if txt.startswith("y"):
         await update.message.reply_text("Enter USDC amount to BUY on trigger (for YES outcome):")
         return BUY_AMOUNT
     else:
@@ -516,65 +516,69 @@ async def got_buy_after_yn(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Trigger configured. Starting monitoring...")
         return await start_trigger_monitoring(update, context)
 
+
 async def got_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
     try:
         val = float(update.message.text.strip())
         if val <= 0:
             raise ValueError
-        context.user_data['buy_usdc'] = val
-        await update.message.reply_text(f"Will BUY ${val:.2f} USDC of YES after selling on trigger.
-Starting monitoring...")
+        context.user_data["buy_usdc"] = val
+        await update.message.reply_text(
+            f"Will BUY ${val:.2f} USDC of YES after selling on trigger.\nStarting monitoring..."
+        )
         return await start_trigger_monitoring(update, context)
     except Exception:
         await update.message.reply_text("Invalid amount. Enter numeric USDC value:")
         return BUY_AMOUNT
+
 
 async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     # populate application.bot_data with required trigger fields
     app = context.application
     user = context.user_data
     # token to sell is the selected outcome token
-    app.bot_data['token_id_sell'] = user.get('token_id')
+    app.bot_data["token_id_sell"] = user.get("token_id")
     # store both absolute sell_shares (if custom) and optional sell_percent
-    app.bot_data['sell_shares'] = user.get('sell_shares', 0.0)
-    if 'sell_percent' in user:
-        app.bot_data['sell_percent'] = user['sell_percent']
+    app.bot_data["sell_shares"] = user.get("sell_shares", 0.0)
+    if "sell_percent" in user:
+        app.bot_data["sell_percent"] = user["sell_percent"]
     # buy target: prefer YES outcome (0) if present, otherwise same
-    outcomes = user.get('outcomes', [])
-    token_ids = user.get('token_ids', [])
+    outcomes = user.get("outcomes", [])
+    token_ids = user.get("token_ids", [])
     # Determine buy token: if two outcomes and user selected sell on 1, buy the other if it's YES
     token_buy = None
     if len(token_ids) >= 2:
-        sel_tok = user.get('token_id')
+        sel_tok = user.get("token_id")
         for t in token_ids:
             if t != sel_tok:
                 token_buy = t
                 break
     if token_buy is None:
-        token_buy = user.get('token_id')  # fallback
-    app.bot_data['token_id_buy'] = token_buy
-    app.bot_data['buy_usdc'] = user.get('buy_usdc', 0.0)
-    app.bot_data['from_outcome'] = user.get('outcome')
+        token_buy = user.get("token_id")  # fallback
+    app.bot_data["token_id_buy"] = token_buy
+    app.bot_data["buy_usdc"] = user.get("buy_usdc", 0.0)
+    app.bot_data["from_outcome"] = user.get("outcome")
     # determine human-readable target outcome label
-    if token_buy and token_buy != user.get('token_id'):
+    if token_buy and token_buy != user.get("token_id"):
         try:
-            idx_sell = user['token_ids'].index(user['token_id'])
-            idx_buy = user['token_ids'].index(token_buy)
-            app.bot_data['target_outcome'] = user['outcomes'][idx_buy]
+            idx_sell = user["token_ids"].index(user["token_id"])
+            idx_buy = user["token_ids"].index(token_buy)
+            app.bot_data["target_outcome"] = user["outcomes"][idx_buy]
         except:
-            app.bot_data['target_outcome'] = "Target"
+            app.bot_data["target_outcome"] = "Target"
     else:
-        app.bot_data['target_outcome'] = user.get('outcome')
+        app.bot_data["target_outcome"] = user.get("outcome")
 
-    app.bot_data['chat_id'] = update.effective_chat.id
-    app.bot_data['yt_monitoring'] = True
-    app.bot_data['yt_api_keys'] = YT_API_KEYS
-    app.bot_data['yt_channel_id'] = YT_CHANNEL_ID
+    app.bot_data["chat_id"] = update.effective_chat.id
+    app.bot_data["yt_monitoring"] = True
+    app.bot_data["yt_api_keys"] = YT_API_KEYS
+    app.bot_data["yt_channel_id"] = YT_CHANNEL_ID
 
     # start background monitoring task
     app.create_task(monitor_youtube_and_trigger(app))
     await update.message.reply_text("🚀 Monitoring started. Will act when subscriber count changes.")
     return ConversationHandler.END
+
 
 # ---- Normal buy/sell flows ----
 async def got_amount_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
@@ -583,17 +587,17 @@ async def got_amount_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         val = float(update.message.text.strip())
         if val <= 0:
             raise ValueError
-        mode = context.user_data.get('normal_action')
-        token_id = context.user_data.get('token_id')
-        outcome = context.user_data.get('outcome')
-        if mode == 'buy':
+        mode = context.user_data.get("normal_action")
+        token_id = context.user_data.get("token_id")
+        outcome = context.user_data.get("outcome")
+        if mode == "buy":
             # val is USDC
             resp = place_market_order(token_id, val, BUY)
             await update.message.reply_text(f"Normal BUY placed (or simulated). Response: {resp}")
             return ConversationHandler.END
         else:
             # val is shares (or percent)
-            bal = context.user_data.get('balance', 0.0)
+            bal = context.user_data.get("balance", 0.0)
             # if user passed a percent like 25/50/100, treat as percent
             if val in (25, 50, 100):
                 sell_shares = bal * (val / 100.0)
@@ -609,21 +613,23 @@ async def got_amount_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid numeric amount. Try again.")
         return AMOUNT
 
+
 # ---------- Commands ----------
 async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data['yt_monitoring'] = False
+    context.application.bot_data["yt_monitoring"] = False
     await update.message.reply_text("YouTube monitoring stopped.")
+
 
 async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
     bd = context.application.bot_data
-    monitoring = bd.get('yt_monitoring', False)
-    await update.message.reply_text(f"DRY_RUN={DRY_RUN}
-YT monitoring: {monitoring}
-YT keys configured: {len(YT_API_KEYS)}")
+    monitoring = bd.get("yt_monitoring", False)
+    await update.message.reply_text(f"DRY_RUN={DRY_RUN}\nYT monitoring: {monitoring}\nYT keys configured: {len(YT_API_KEYS)}")
+
 
 async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Cancelled.")
     return ConversationHandler.END
+
 
 # ---------- Dispatcher wiring ----------
 def main():
@@ -653,8 +659,8 @@ def main():
     app.add_handler(CommandHandler("check_latest_subs", check_latest_subs))
 
     # persist some bot_data defaults
-    app.bot_data['yt_api_keys'] = YT_API_KEYS
-    app.bot_data['yt_channel_id'] = YT_CHANNEL_ID
+    app.bot_data["yt_api_keys"] = YT_API_KEYS
+    app.bot_data["yt_channel_id"] = YT_CHANNEL_ID
 
     print("Bot running. Use /start. DRY_RUN =", DRY_RUN)
     app.run_polling(allowed_updates=Update.ALL_TYPES)
