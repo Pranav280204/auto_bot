@@ -1,670 +1,315 @@
 import os
-import json
-import time
-import asyncio
-import aiohttp
-from datetime import datetime, timezone
-
+import re
 import requests
-from dotenv import load_dotenv
-from web3 import Web3
+import telebot
+import hashlib
+from ecdsa import SigningKey, SECP256k1
 
-from py_clob_client.client import ClobClient
-from py_clob_client.clob_types import MarketOrderArgs, OrderType
-from py_clob_client.order_builder.constants import BUY, SELL
+# Polymarket trading imports (only if AUTO_TRADE enabled)
+if os.environ.get("AUTO_TRADE", "false").lower() == "true":
+    from py_clob_client.client import ClobClient
+    from py_clob_client.clob_types import OrderArgs
 
-from telegram import Update
-from telegram.ext import (
-    Application,
-    CommandHandler,
-    MessageHandler,
-    filters,
-    ConversationHandler,
-    ContextTypes,
-)
+# Environment variables
+BOT_TOKEN = os.environ.get("BOT_TOKEN")
+API_TOKEN = os.environ.get("API_TOKEN")
+PRIVATE_KEY = os.environ.get("PRIVATE_KEY")  # Revealed magic key with or without 0x
+WALLET_ADDRESS = os.environ.get("WALLET_ADDRESS")  # Optional: set manually
+AUTO_TRADE = os.environ.get("AUTO_TRADE", "false").lower() == "true"
+TRADE_AMOUNT = float(os.environ.get("TRADE_AMOUNT", "20"))  # USD amount to spend per opportunity
 
-load_dotenv()
+if not BOT_TOKEN:
+    print("ERROR: BOT_TOKEN not set!")
+    exit(1)
 
-# ---------- Config ----------
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-DRY_RUN = os.getenv("DRY_RUN", "True").lower() == "true"
+bot = telebot.TeleBot(BOT_TOKEN)
 
-GAMMA_API = os.getenv("GAMMA_API", "https://gamma-api.polymarket.com")
-CLOB_API = os.getenv("CLOB_API", "https://clob.polymarket.com")
-POLYGON_RPC = os.getenv("POLYGON_RPC", "https://polygon-rpc.com/")
-CONDITIONAL_TOKENS = os.getenv("CONDITIONAL_TOKENS", "0x4D97DCd97eC945f40cF65F87097ACe5EA0476045")
+# Derive address if not set in env
+def derive_address(private_key: str) -> str:
+    pk = private_key[2:] if private_key.startswith('0x') else private_key
+    priv_key_bytes = bytes.fromhex(pk)
+    sk = SigningKey.from_string(priv_key_bytes, curve=SECP256k1)
+    vk = sk.verifying_key
+    uncompressed_pub_key = b'\x04' + vk.to_string()
+    keccak = hashlib.sha3_256(uncompressed_pub_key).digest()
+    return '0x' + keccak[-20:].hex()
 
-# YouTube monitoring
-# Provide comma-separated YouTube API keys in env: YOUTUBE_API_KEYS="key1,key2,..."
-YT_API_KEYS = [k.strip() for k in os.getenv("YOUTUBE_API_KEYS", "").split(",") if k.strip()]
-YOUTUBE_CHANNEL_ID = os.getenv("YOUTUBE_CHANNEL_ID")
-POLL_INTERVAL = float(os.getenv("YT_POLL_INTERVAL"))  # backend polling interval (seconds)
-TELEGRAM_HEARTBEAT = float(os.getenv("YT_HEARTBEAT", "10"))  # how often to send Telegram messages (seconds)
+if PRIVATE_KEY and not WALLET_ADDRESS:
+    WALLET_ADDRESS = derive_address(PRIVATE_KEY)
 
-if not TELEGRAM_BOT_TOKEN:
-    raise ValueError("Missing TELEGRAM_BOT_TOKEN in environment")
+# Video ID extraction
+def extract_video_id(user_input):
+    patterns = [
+        r'(?:v=|\/embed\/|\/shorts\/|\/watch\?v=|youtu\.be\/)([0-9A-Za-z_-]{11})',
+        r'^([0-9A-Za-z_-]{11})$'
+    ]
+    for pattern in patterns:
+        match = re.search(pattern, user_input)
+        if match:
+            return match.group(1)
+    return None
 
-# ---------- Web3 + ClobClient ----------
-w3 = Web3(Web3.HTTPProvider(POLYGON_RPC))
-client = None
-if PRIVATE_KEY:
+# Clean transcript extraction
+def extract_transcript_text(data):
+    text_parts = []
+    def collect(obj):
+        if isinstance(obj, str):
+            text_parts.append(obj)
+        elif isinstance(obj, dict):
+            if 'text' in obj and isinstance(obj['text'], str):
+                text_parts.append(obj['text'])
+            else:
+                for v in obj.values():
+                    collect(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                collect(item)
+    collect(data)
+    return " ".join(text_parts)
+
+# Current word groups (updated to match active Feb 2026 markets)
+word_groups = {
+    "Dollar": r"\bdollar(s)?\b",
+    "Thousand/Million": r"\b(thousand|million|billion)(s)?\b",
+    "Challenge": r"\bchallenge(s)?\b",
+    "Eliminated": r"\beliminated?\b",
+    "Trap": r"\btrap(s)?\b",
+    "Car/Supercar": r"\b(car|supercar)(s)?\b",
+    "Tesla/Lamborghini": r"\b(tesla|lamborghini)(s)?\b",
+    "Helicopter/Jet": r"\b(helicopter|jet)(s)?\b",
+    "Island": r"\bisland(s)?\b",
+    "Mystery Box": r"\bmystery\s+box(es)?\b",
+    "Massive": r"\bmassive\b",
+    "World's Biggest/Largest": r"\bworld'?s?\s+(biggest|largest)\b",
+    "Beast Games": r"\bbeast\s+games\b",
+    "Feastables": r"\bfeastables\b",
+    "MrBeast": r"\bmr\.?\s*beast\b",
+    "Insane": r"\binsane\b",
+    "Subscribe": r"\bsubscrib(e|ed|ing|er|s)?\b"
+}
+
+polymarket_keywords = {
+    "Dollar": "dollar",
+    "Thousand/Million": "thousand|million",
+    "Challenge": "challenge",
+    "Eliminated": "eliminated",
+    "Trap": "trap",
+    "Car/Supercar": "car|supercar",
+    "Tesla/Lamborghini": "tesla|lamborghini",
+    "Helicopter/Jet": "helicopter|jet",
+    "Island": "island",
+    "Mystery Box": "mystery box",
+    "Massive": "massive",
+    "World's Biggest/Largest": "world.?s (biggest|largest)",
+    "Beast Games": "beast games",
+    "Feastables": "feastables",
+    "MrBeast": "mrbeast|mr.?beast",
+    "Insane": "insane",
+    "Subscribe": "subscribe"
+}
+
+# Fetch Polymarket data + dynamic thresholds
+def get_polymarket_data():
     try:
-        client = ClobClient(host=CLOB_API, key=PRIVATE_KEY, chain_id=137, signature_type=1, funder=WALLET_ADDRESS)
-        creds = client.create_or_derive_api_creds()
-        client.set_api_creds(creds)
-    except Exception as e:
-        print("Warning: failed to create/set ClobClient creds:", e)
-        client = client  # may be None or partially initialized
+        url = "https://gamma-api.polymarket.com/events?active=true"
+        response = requests.get(url, timeout=15)
+        response.raise_for_status()
+        events = response.json()
 
-ERC1155_ABI = [
-    {
-        "inputs": [{"name": "account", "type": "address"}, {"name": "id", "type": "uint256"}],
-        "name": "balanceOf",
-        "outputs": [{"name": "", "type": "uint256"}],
-        "stateMutability": "view",
-        "type": "function",
-    }
-]
-
-# ---------- Conversation states ----------
-SLUG, MARKET_IDX, OUTCOME_IDX, MODE_CHOICE, ACTION, AMOUNT, CONFIRM, SELL_CHOICE, BUY_AFTER_YN, BUY_AMOUNT, START_MONITOR = range(11)
-
-# ---------- Helpers ----------
-def fetch_active_markets(slug):
-    try:
-        r = requests.get(f"{GAMMA_API}/events/slug/{slug}", timeout=10)
-        r.raise_for_status()
-        event = r.json()
-        markets = event.get("markets", []) or []
-        active = [m for m in markets if m.get("active", False) and not m.get("closed", True)]
-        return active
-    except Exception as e:
-        print("fetch_active_markets error:", e)
-        return []
-
-
-def normalize_outcomes_and_token_ids(market):
-    outcomes = market.get("outcomes", [])
-    token_ids = market.get("clobTokenIds", [])
-    if isinstance(outcomes, str):
-        try:
-            outcomes = json.loads(outcomes)
-        except:
-            outcomes = []
-    if isinstance(token_ids, str):
-        try:
-            token_ids = json.loads(token_ids)
-        except:
-            token_ids = []
-    return outcomes, token_ids
-
-
-def get_mid_price(token_id):
-    try:
-        if not client:
-            return None
-        book = client.get_order_book(token_id)
-        bids = [float(p) for p, _ in book.get("bids", [])] if book.get("bids") else []
-        asks = [float(p) for p, _ in book.get("asks", [])] if book.get("asks") else []
-        if bids and asks:
-            return (max(bids) + min(asks)) / 2.0
-        if bids:
-            return max(bids)
-        if asks:
-            return min(asks)
-        return None
-    except Exception as e:
-        print("get_mid_price error:", e)
-        return None
-
-
-def get_balance_shares(token_id):
-    try:
-        contract = w3.eth.contract(address=w3.to_checksum_address(CONDITIONAL_TOKENS), abi=ERC1155_ABI)
-        balance_wei = contract.functions.balanceOf(w3.to_checksum_address(WALLET_ADDRESS), int(token_id)).call()
-        return balance_wei / 1_000_000  # assume 6 decimals
-    except Exception as e:
-        print("get_balance_shares error:", e)
-        return 0.0
-
-
-def place_market_order(token_id, amount, side):
-    """
-    - For BUY: amount is USDC (float)
-    - For SELL: amount is shares (float)
-    """
-    if DRY_RUN or client is None:
-        print(f"[DRY RUN] place_market_order token={token_id} side={side} amount={amount}")
-        return {"status": "dry_run"}
-    try:
-        args = MarketOrderArgs(token_id=token_id, amount=amount, side=side, order_type=OrderType.FOK)
-        signed = client.create_market_order(args)
-        resp = client.post_order(signed, OrderType.FOK)
-        print("Order placed:", resp)
-        return resp
-    except Exception as e:
-        print("place_market_order error:", e)
-        return {"error": str(e)}
-
-
-# ---------- YouTube helper (round-robin keys) ----------
-class YTKeyRotator:
-    def __init__(self, keys):
-        self.keys = keys or []
-        self.idx = 0
-
-    def get_key(self):
-        if not self.keys:
-            return None
-        k = self.keys[self.idx % len(self.keys)]
-        self.idx += 1
-        return k
-
-
-async def fetch_channel_subs(session: aiohttp.ClientSession, api_key: str, channel_id: str):
-    url = "https://www.googleapis.com/youtube/v3/channels"
-    params = {"part": "statistics", "id": channel_id, "key": api_key}
-    try:
-        async with session.get(url, params=params, timeout=10) as resp:
-            if resp.status != 200:
-                text = await resp.text()
-                return {"error": f"HTTP {resp.status}: {text}"}
-            data = await resp.json()
-            items = data.get("items", [])
-            if not items:
-                return {"error": "no items"}
-            stats = items[0].get("statistics", {})
-            subs = int(stats.get("subscriberCount", 0))
-            return {"subs": subs}
-    except Exception as e:
-        return {"error": str(e)}
-
-
-# ---------- Monitoring coroutine ----------
-async def monitor_youtube_and_trigger(application: Application):
-    """Monitor YouTube every POLL_INTERVAL seconds (backend), but send Telegram updates at most
-    once every TELEGRAM_HEARTBEAT seconds. Trades are executed immediately on subscriber change,
-    but messages reporting status/trades are rate-limited by TELEGRAM_HEARTBEAT.
-    """
-    print("YouTube monitor: started")
-
-    rotator = YTKeyRotator(application.bot_data.get("yt_api_keys", []))
-    channel_id = application.bot_data.get("YOUTUBE_CHANNEL_ID")
-    chat_id = application.bot_data.get("chat_id")
-
-    last_subs = None
-    last_telegram_time = 0.0
-
-    # buffer trades that happened since last message
-    trade_log = []
-
-    async with aiohttp.ClientSession() as session:
-        # Initial fetch (try a few keys)
-        for _ in range(3):
-            key = rotator.get_key()
-            if not key:
-                break
-            res = await fetch_channel_subs(session, key, channel_id)
-            if "subs" in res:
-                last_subs = res["subs"]
+        target_event = None
+        for event in events:
+            title_lower = event.get("title", "").lower()
+            if "mrbeast" in title_lower and "next" in title_lower and "youtube" in title_lower:
+                target_event = event
                 break
 
-        if last_subs is None:
-            last_subs = 0
+        if not target_event:
+            return None, None, None
 
-        while application.bot_data.get("yt_monitoring", False):
-            loop_start = time.time()
-            now = datetime.now(timezone.utc)
+        markets = target_event.get("markets", [])
+        prices = {}
+        token_ids = {}
+        dyn_thresholds = {cat: 1 for cat in word_groups}  # default 1+
 
-            key = rotator.get_key()
-            if not key:
-                # no API keys configured: still wait at poll interval
-                await asyncio.sleep(POLL_INTERVAL)
-                continue
+        for market in markets:
+            q_lower = market.get("question", "").lower()
+            matched_cat = None
+            for cat, keyword in polymarket_keywords.items():
+                if re.search(keyword, q_lower):
+                    matched_cat = cat
+                    # Extract threshold like "10+ times"
+                    thresh_match = re.search(r'(\d+)\+?\s*times', q_lower)
+                    if thresh_match:
+                        dyn_thresholds[cat] = int(thresh_match.group(1))
+                    break
 
-            res = await fetch_channel_subs(session, key, channel_id)
+            if matched_cat:
+                outcome_prices = market.get("outcome_prices", [])
+                if len(outcome_prices) >= 2:
+                    yes_price = float(outcome_prices[0])
+                    prices[matched_cat] = yes_price
+                    for token in market.get("tokens", []):
+                        if token.get("outcome", "").lower() == "yes":
+                            token_ids[matched_cat] = token.get("token_id")
+                            break
 
-            subs = last_subs
-            changed = False
+        return prices, token_ids, dyn_thresholds
 
-            if "subs" in res:
-                subs = res["subs"]
+    except Exception as e:
+        print(f"Polymarket error: {e}")
+        return None, None, None
 
-                # TRIGGER ACTIONS IMMEDIATELY if subscriber count changed
-                if subs != last_subs:
-                    changed = True
+def format_results(text_lower):
+    counts = {cat: len(re.findall(pattern, text_lower)) for cat, pattern in word_groups.items()}
+    sorted_counts = dict(sorted(counts.items()))
+    total = sum(sorted_counts.values())
 
-                    token_sell = application.bot_data.get("token_id_sell")
-                    configured_sell = application.bot_data.get("sell_shares", 0)
-                    sell_percent = application.bot_data.get("sell_percent", None)
-                    token_buy = application.bot_data.get("token_id_buy")
-                    buy_usdc = application.bot_data.get("buy_usdc", 0)
+    # Word count table
+    msg = "<pre>"
+    msg += f"{'Category':<30} {'Count':>8}\n"
+    msg += "-" * 40 + "\n"
+    for category, count in sorted_counts.items():
+        msg += f"{category:<30} {count:>8}\n"
+    msg += "-" * 40 + "\n"
+    msg += f"{'TOTAL':<30} {total:>8}\n"
+    msg += "</pre>"
 
-                    # prevent concurrent trades
-                    in_trade = application.bot_data.get("in_trade", False)
-                    if in_trade:
-                        trade_log.append("Skipped trade: another trade is in progress")
-                    else:
-                        application.bot_data["in_trade"] = True
-                        try:
-                            # SELL first (re-check balance at trigger time)
-                            if token_sell:
-                                current_bal = get_balance_shares(token_sell)
+    # Polymarket section
+    prices, token_ids, dyn_thresholds = get_polymarket_data()
+    poly_section = ""
+    opportunities = []
+    trade_section = ""
 
-                                # if a percent was chosen earlier, compute configured_sell from current balance
-                                if sell_percent is not None:
-                                    configured_sell = current_bal * float(sell_percent)
+    if prices:
+        poly_section += "\n<b>📈 Polymarket MrBeast Markets (Feb 2026)</b>\n<pre>"
+        poly_section += f"{'Category':<30} {'Count':>6} {'≥Thresh':>9} {'Yes ¢':>8} {'Status':>20}\n"
+        poly_section += "-" * 80 + "\n"
 
-                                # decide actual sell amount = min(configured, current)
-                                sell_to_place = min(configured_sell, current_bal)
+        for cat, count in sorted_counts.items():
+            thresh = dyn_thresholds.get(cat, 1)
+            yes_p = prices.get(cat)
+            status = ""
+            if count >= thresh and yes_p is not None and yes_p < 0.95:
+                edge = (1.0 - yes_p) / yes_p * 100
+                status = f"SNIPABLE (~{edge:.0f}% edge)"
+                opportunities.append((cat, token_ids.get(cat), yes_p))
 
-                                if sell_to_place <= 1e-9:
-                                    trade_log.append(
-                                        f"SKIPPED SELL: configured {configured_sell:.6f} but current balance is {current_bal:.6f}"
-                                    )
-                                else:
-                                    if sell_to_place < configured_sell - 1e-9:
-                                        trade_log.append(
-                                            f"Adjusted SELL from {configured_sell:.6f} to available {sell_to_place:.6f} shares"
-                                        )
-                                    t0 = time.time()
-                                    resp = await asyncio.to_thread(place_market_order, token_sell, sell_to_place, SELL)
-                                    took = time.time() - t0
-                                    trade_log.append(f"SELL {sell_to_place:.6f} shares (took {took:.3f}s) | resp={resp}")
+            yes_str = f"{yes_p:.2f}" if yes_p is not None else "N/A"
+            poly_section += f"{cat:<30} {count:>6} {f'≥{thresh}':>9} {yes_str:>8} {status:>20}\n"
 
-                            # BUY after sell
-                            if buy_usdc > 0 and token_buy:
-                                t0 = time.time()
-                                resp = await asyncio.to_thread(place_market_order, token_buy, buy_usdc, BUY)
-                                took = time.time() - t0
-                                trade_log.append(f"BUY ${buy_usdc:.2f} YES (took {took:.3f}s) | resp={resp}")
+        poly_section += "-" * 80 + "\n"
+        if opportunities:
+            poly_section += f"\n<b>🚨 {len(opportunities)} OPPORTUNITIES!</b>"
+        else:
+            poly_section += "\nNo strong edges."
+        poly_section += "</pre>"
+    else:
+        poly_section += "\n<i>⚠️ No active market or API issue.</i>"
 
-                        finally:
-                            application.bot_data["in_trade"] = False
+    # Auto-trading
+    if AUTO_TRADE and PRIVATE_KEY and opportunities and prices:
+        try:
+            pk_for_client = PRIVATE_KEY[2:] if PRIVATE_KEY.startswith('0x') else PRIVATE_KEY
+            client = ClobClient(
+                host="https://clob.polymarket.com",
+                chain_id=137,
+                key=pk_for_client
+            )
+            api_creds = client.create_or_derive_api_creds()
+            client.api_key = api_creds["api_key"]
+            client.api_secret = api_creds["api_secret"]
+            client.api_passphrase = api_creds["api_passphrase"]
 
-                    last_subs = subs
+            address = client.get_address()
+            trade_section += f"\n<b>🤖 Auto-trading from {address[:8]}... (${TRADE_AMOUNT} per opp)</b>"
 
-            # Decide whether to send Telegram message now (heartbeat)
-            now_ts = time.time()
-            time_since_last_msg = now_ts - last_telegram_time
-            should_send = time_since_last_msg >= TELEGRAM_HEARTBEAT
+            for cat, token_id, yes_p in opportunities:
+                if not token_id:
+                    continue
+                max_price = min(0.99, yes_p + 0.10)
+                size = TRADE_AMOUNT / max_price
 
-            if should_send:
-                # Build message including any trades that happened since last message
-                msg_lines = [
-                    "📊 **MrBeast Subscriber Monitor**",
-                    f"Time: {now.strftime('%H:%M:%S')} UTC",
-                    f"Subscribers: {subs:,}",
-                ]
-
-                if trade_log:
-                    msg_lines.append("\n🚨 **TRADES EXECUTED SINCE LAST UPDATE**")
-                    msg_lines.extend(trade_log)
-                    trade_log.clear()
-                else:
-                    if changed:
-                        msg_lines.append("\n✅ Change detected but no trades configured.")
-                    else:
-                        msg_lines.append("\nNo change detected.")
-
-                msg_text = "\n".join(msg_lines)
-
+                order_args = OrderArgs(
+                    token_id=token_id,
+                    price=max_price,
+                    size=round(size, 6),
+                    side="BUY"
+                )
                 try:
-                    await application.bot.send_message(chat_id=chat_id, text=msg_text)
+                    order = client.create_order(order_args)
+                    signed = client.sign_order(order)
+                    resp = client.post_order(signed)
+                    if resp.get("order_id") or resp.get("status") == "SUCCESS":
+                        trade_section += f"\n✅ Bought {cat} Yes (~${TRADE_AMOUNT})"
+                    else:
+                        trade_section += f"\n⚠️ {cat}: {resp.get('message', 'Failed')}"
                 except Exception as e:
-                    print("Telegram send error:", e)
+                    trade_section += f"\n❌ {cat}: {str(e)[:80]}"
+        except Exception as e:
+            trade_section += f"\n❌ Trading setup failed: {str(e)[:150]}"
 
-                last_telegram_time = now_ts
+    return f"<b>MrBeast Word Count + Sniper 🚀</b>\n\n{msg}{poly_section}{trade_section}"
 
-            # sleep so backend polling remains at POLL_INTERVAL cadence
-            elapsed = time.time() - loop_start
-            await asyncio.sleep(max(0, POLL_INTERVAL - elapsed))
+@bot.message_handler(commands=['start', 'help'])
+def send_welcome(message):
+    welcome_text = (
+        "<b>MrBeast Word Counter + Polymarket Sniper Bot! 👋</b>\n\n"
+        "Send YouTube URL/ID, transcript text, or .txt file.\n\n"
+        "Features:\n"
+        "• Auto-transcript fetch\n"
+        "• Buzzword counts\n"
+        "• Live Polymarket odds + dynamic thresholds (Dollar/Thousand 10+, others 1+)\n"
+        "• Auto-snipe underpriced Yes shares (${os.environ.get('TRADE_AMOUNT', '20')} per opportunity if AUTO_TRADE=true)\n\n"
+        f"Wallet: {WALLET_ADDRESS or 'Not set'}"
+    )
+    bot.reply_to(message, welcome_text, parse_mode='HTML')
 
-    print("YouTube monitor: stopped")
-
-
-# ---------- New command: check_latest_subs ----------
-async def check_latest_subs(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    """Fetch the latest subscriber count using configured YT API keys and reply in chat."""
-    app = context.application
-    keys = app.bot_data.get("yt_api_keys", []) or YT_API_KEYS
-    channel_id = app.bot_data.get("YOUTUBE_CHANNEL_ID", YOUTUBE_CHANNEL_ID)
-
-    if not keys:
-        await update.message.reply_text("No YouTube API keys configured (set YOUTUBE_API_KEYS in env).")
+# Handlers unchanged (text + document)
+@bot.message_handler(content_types=['text'])
+def handle_text(message):
+    user_text = message.text.strip()
+    if not user_text:
         return
 
-    rot = YTKeyRotator(keys)
-    last_err = None
-    async with aiohttp.ClientSession() as session:
-        for _ in range(max(1, len(keys))):
-            key = rot.get_key()
-            if not key:
-                break
-            res = await fetch_channel_subs(session, key, channel_id)
-            if "subs" in res:
-                ts = datetime.now(timezone.utc).strftime("%Y-%m-%d %H:%M:%S UTC")
-                await update.message.reply_text(f"Latest subscribers: {res['subs']:,} (fetched at {ts})")
-                return
-            last_err = res.get("error") if isinstance(res, dict) else str(res)
+    video_id = extract_video_id(user_text)
 
-    await update.message.reply_text(f"Failed to fetch subscribers. Last error: {last_err}")
-
-
-# ---------- Telegram conversation handlers ----------
-async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Enter Polymarket event slug:")
-    return SLUG
-
-
-async def got_slug(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    slug = update.message.text.strip()
-    markets = fetch_active_markets(slug)
-    if not markets:
-        await update.message.reply_text("No active markets found.")
-        return ConversationHandler.END
-    context.user_data["slug"] = slug
-    context.user_data["markets"] = markets
-    text = f"Found {len(markets)} active market(s):\n"
-    for i, m in enumerate(markets):
-        text += f"{i}: {m.get('question', 'Unknown')}\n"
-    text += "\nSelect market number:"
-    await update.message.reply_text(text)
-    return MARKET_IDX
-
-
-async def got_market_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        idx = int(update.message.text.strip())
-        markets = context.user_data["markets"]
-        market = markets[idx]
-        outcomes, token_ids = normalize_outcomes_and_token_ids(market)
-        if not outcomes or not token_ids:
-            await update.message.reply_text("Market missing outcomes or token ids.")
-            return ConversationHandler.END
-        context.user_data["market"] = market
-        context.user_data["outcomes"] = outcomes
-        context.user_data["token_ids"] = token_ids
-
-        # After selecting market, ask normal / trigger choice
-        await update.message.reply_text(
-            "Choose action:\n1 = Normal Buy\n2 = Normal Sell\n3 = Trigger action (YouTube subscriber change)"
-        )
-        return MODE_CHOICE
-    except Exception:
-        await update.message.reply_text("Invalid market index.")
-        return MARKET_IDX
-
-
-async def got_mode_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ch = update.message.text.strip()
-    if ch not in ("1", "2", "3"):
-        await update.message.reply_text("Choose 1, 2 or 3.")
-        return MODE_CHOICE
-    context.user_data["mode"] = ch
-    # Ask outcome:
-    outcomes = context.user_data["outcomes"]
-    text = "Select outcome number:\n"
-    for i, o in enumerate(outcomes):
-        text += f"{i}: {o}\n"
-    await update.message.reply_text(text)
-    return OUTCOME_IDX
-
-
-async def got_outcome_idx(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        idx = int(update.message.text.strip())
-        outcomes = context.user_data["outcomes"]
-        token_ids = context.user_data["token_ids"]
-        outcome = outcomes[idx]
-        token_id = token_ids[idx]
-        context.user_data["outcome"] = outcome
-        context.user_data["token_id"] = token_id
-
-        mid = get_mid_price(token_id)
-        mid_str = f"{mid:.6f}" if mid else "N/A"
-        mode = context.user_data["mode"]
-
-        if mode == "1":  # Normal Buy
-            await update.message.reply_text(
-                f"Normal BUY selected. Outcome: {outcome} | Mid: {mid_str}\nEnter USDC amount to BUY:"
-            )
-            context.user_data["normal_action"] = "buy"
-            return AMOUNT
-        elif mode == "2":  # Normal Sell
-            # check balance
-            bal = get_balance_shares(token_id)
-            context.user_data["balance"] = bal
-            await update.message.reply_text(
-                f"Normal SELL selected. Outcome: {outcome} | Your balance: {bal:.6f} shares\nEnter shares to SELL (or type 25/50/100 for percent):"
-            )
-            context.user_data["normal_action"] = "sell"
-            return AMOUNT
-        else:
-            # Trigger flow: ask whether to sell on trigger or buy
-            await update.message.reply_text("Trigger action selected.\nDo you want to SELL on subscriber change? (y/n)")
-            return ACTION
-    except Exception:
-        await update.message.reply_text("Invalid outcome index.")
-        return OUTCOME_IDX
-
-
-async def got_action(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Used only in trigger flow: decide if SELL on trigger
-    text = update.message.text.strip().lower()
-    if text.startswith("y"):
-        # SELL on trigger — ask percent to sell
-        token_id = context.user_data["token_id"]
-        bal = get_balance_shares(token_id)
-        context.user_data["balance"] = bal
-        await update.message.reply_text(
-            f"You have {bal:.6f} shares on this outcome.\nChoose percent to SELL on trigger:\n1=25%\n2=50%\n3=100%\n4=custom (enter shares)"
-        )
-        return SELL_CHOICE
-    else:
-        # No sell; ask whether to buy YES on trigger (if user wants buy-only)
-        await update.message.reply_text("Do you want to BUY YES on trigger when subscriber count changes? (y/n)")
-        return BUY_AFTER_YN
-
-
-async def got_sell_choice(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    ch = update.message.text.strip()
-    bal = context.user_data.get("balance", 0.0)
-    if ch in ("1", "2", "3"):
-        per = {"1": 0.25, "2": 0.5, "3": 1.0}[ch]
-        # store percent and compute final amount at trigger time from current balance
-        context.user_data["sell_percent"] = per
-        await update.message.reply_text(
-            f"Will SELL {int(per*100)}% on trigger (calculated from current balance at trigger time).\nAfter selling, do you want to BUY YES on trigger? (y/n)"
-        )
-        return BUY_AFTER_YN
-    elif ch == "4":
-        await update.message.reply_text("Enter CUSTOM shares to sell on trigger (numeric):")
-        return CONFIRM  # we'll reuse CONFIRM to accept numeric custom shares
-    else:
-        await update.message.reply_text("Invalid choice.")
-        return SELL_CHOICE
-
-
-async def got_confirm_custom_sell(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # CONFIRM used to accept custom sell shares value in trigger flow before buy question
-    try:
-        val = float(update.message.text.strip())
-        bal = context.user_data.get("balance", 0.0)
-        if val <= 0 or val > bal:
-            await update.message.reply_text("Invalid shares (must be >0 and <= balance). Enter again:")
-            return CONFIRM
-        context.user_data["sell_shares"] = val
-        await update.message.reply_text(
-            f"Will SELL {val:.6f} shares on trigger.\nAfter selling, do you want to BUY YES on trigger? (y/n)"
-        )
-        return BUY_AFTER_YN
-    except Exception:
-        await update.message.reply_text("Invalid numeric input. Enter shares as a number:")
-        return CONFIRM
-
-
-async def got_buy_after_yn(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    txt = update.message.text.strip().lower()
-    if txt.startswith("y"):
-        await update.message.reply_text("Enter USDC amount to BUY on trigger (for YES outcome):")
-        return BUY_AMOUNT
-    else:
-        # finish trigger setup and start monitoring
-        await update.message.reply_text("Trigger configured. Starting monitoring...")
-        return await start_trigger_monitoring(update, context)
-
-
-async def got_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        val = float(update.message.text.strip())
-        if val <= 0:
-            raise ValueError
-        context.user_data["buy_usdc"] = val
-        await update.message.reply_text(
-            f"Will BUY ${val:.2f} USDC of YES after selling on trigger.\nStarting monitoring..."
-        )
-        return await start_trigger_monitoring(update, context)
-    except Exception:
-        await update.message.reply_text("Invalid amount. Enter numeric USDC value:")
-        return BUY_AMOUNT
-
-
-async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # populate application.bot_data with required trigger fields
-    app = context.application
-    user = context.user_data
-    # token to sell is the selected outcome token
-    app.bot_data["token_id_sell"] = user.get("token_id")
-    # store both absolute sell_shares (if custom) and optional sell_percent
-    app.bot_data["sell_shares"] = user.get("sell_shares", 0.0)
-    if "sell_percent" in user:
-        app.bot_data["sell_percent"] = user["sell_percent"]
-    # buy target: prefer YES outcome (0) if present, otherwise same
-    outcomes = user.get("outcomes", [])
-    token_ids = user.get("token_ids", [])
-    # Determine buy token: if two outcomes and user selected sell on 1, buy the other if it's YES
-    token_buy = None
-    if len(token_ids) >= 2:
-        sel_tok = user.get("token_id")
-        for t in token_ids:
-            if t != sel_tok:
-                token_buy = t
-                break
-    if token_buy is None:
-        token_buy = user.get("token_id")  # fallback
-    app.bot_data["token_id_buy"] = token_buy
-    app.bot_data["buy_usdc"] = user.get("buy_usdc", 0.0)
-    app.bot_data["from_outcome"] = user.get("outcome")
-    # determine human-readable target outcome label
-    if token_buy and token_buy != user.get("token_id"):
+    if video_id and API_TOKEN:
+        bot.reply_to(message, "🔄 Fetching transcript...")
         try:
-            idx_sell = user["token_ids"].index(user["token_id"])
-            idx_buy = user["token_ids"].index(token_buy)
-            app.bot_data["target_outcome"] = user["outcomes"][idx_buy]
-        except:
-            app.bot_data["target_outcome"] = "Target"
+            url = "https://www.youtube-transcript.io/api/transcripts"
+            headers = {"Authorization": f"Basic {API_TOKEN}", "Content-Type": "application/json"}
+            payload = {"ids": [video_id]}
+            response = requests.post(url, headers=headers, json=payload, timeout=30)
+            response.raise_for_status()
+            raw_text = extract_transcript_text(response.json())
+            if not raw_text.strip():
+                bot.reply_to(message, "No transcript. Paste manually.")
+                return
+        except Exception as e:
+            bot.reply_to(message, f"❌ Fetch error: {str(e)[:200]}")
+            return
     else:
-        app.bot_data["target_outcome"] = user.get("outcome")
+        raw_text = user_text
 
-    app.bot_data["chat_id"] = update.effective_chat.id
-    app.bot_data["yt_monitoring"] = True
-    app.bot_data["yt_api_keys"] = YT_API_KEYS
-    app.bot_data["YOUTUBE_CHANNEL_ID"] = YOUTUBE_CHANNEL_ID
+    result_msg = format_results(raw_text.lower())
+    bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
 
-    # start background monitoring task
-    app.create_task(monitor_youtube_and_trigger(app))
-    await update.message.reply_text("🚀 Monitoring started. Will act when subscriber count changes.")
-    return ConversationHandler.END
+@bot.message_handler(content_types=['document'])
+def handle_document(message):
+    doc = message.document
+    if not (doc.mime_type == 'text/plain' or doc.file_name.lower().endswith('.txt')):
+        bot.reply_to(message, "Send .txt file only.")
+        return
 
-
-# ---- Normal buy/sell flows ----
-async def got_amount_normal(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    # Handles normal buy/sell amounts
+    bot.reply_to(message, "📄 Processing...")
     try:
-        val = float(update.message.text.strip())
-        if val <= 0:
-            raise ValueError
-        mode = context.user_data.get("normal_action")
-        token_id = context.user_data.get("token_id")
-        outcome = context.user_data.get("outcome")
-        if mode == "buy":
-            # val is USDC
-            resp = place_market_order(token_id, val, BUY)
-            await update.message.reply_text(f"Normal BUY placed (or simulated). Response: {resp}")
-            return ConversationHandler.END
-        else:
-            # val is shares (or percent)
-            bal = context.user_data.get("balance", 0.0)
-            # if user passed a percent like 25/50/100, treat as percent
-            if val in (25, 50, 100):
-                sell_shares = bal * (val / 100.0)
-            else:
-                sell_shares = val
-            if sell_shares <= 0 or sell_shares > bal + 1e-9:
-                await update.message.reply_text("Invalid sell shares (exceed balance). Cancelled.")
-                return ConversationHandler.END
-            resp = place_market_order(token_id, sell_shares, SELL)
-            await update.message.reply_text(f"Normal SELL placed (or simulated). Response: {resp}")
-            return ConversationHandler.END
-    except Exception:
-        await update.message.reply_text("Invalid numeric amount. Try again.")
-        return AMOUNT
+        file_info = bot.get_file(doc.file_id)
+        downloaded = bot.download_file(file_info.file_path)
+        transcript = downloaded.decode('utf-8', errors='replace')
+        result_msg = format_results(transcript.lower())
+        bot.send_message(message.chat.id, result_msg, parse_mode='HTML')
+    except Exception as e:
+        bot.reply_to(message, f"❌ Error: {str(e)}")
 
-
-# ---------- Commands ----------
-async def stop_monitor(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    context.application.bot_data["yt_monitoring"] = False
-    await update.message.reply_text("YouTube monitoring stopped.")
-
-
-async def status(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    bd = context.application.bot_data
-    monitoring = bd.get("yt_monitoring", False)
-    await update.message.reply_text(f"DRY_RUN={DRY_RUN}\nYT monitoring: {monitoring}\nYT keys configured: {len(YT_API_KEYS)}")
-
-
-async def cancel(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    await update.message.reply_text("Cancelled.")
-    return ConversationHandler.END
-
-
-# ---------- Dispatcher wiring ----------
-def main():
-    app = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
-
-    conv = ConversationHandler(
-        entry_points=[CommandHandler("start", start)],
-        states={
-            SLUG: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_slug)],
-            MARKET_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_market_idx)],
-            MODE_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_mode_choice)],
-            OUTCOME_IDX: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_outcome_idx)],
-            ACTION: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_action)],
-            SELL_CHOICE: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_sell_choice)],
-            CONFIRM: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_confirm_custom_sell)],
-            BUY_AFTER_YN: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_buy_after_yn)],
-            BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_buy_amount)],
-            AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_amount_normal)],
-        },
-        fallbacks=[CommandHandler("cancel", cancel)],
-        allow_reentry=True,
-    )
-
-    app.add_handler(conv)
-    app.add_handler(CommandHandler("stop", stop_monitor))
-    app.add_handler(CommandHandler("status", status))
-    app.add_handler(CommandHandler("check_latest_subs", check_latest_subs))
-
-    # persist some bot_data defaults
-    app.bot_data["yt_api_keys"] = YT_API_KEYS
-    app.bot_data["YOUTUBE_CHANNEL_ID"] = YOUTUBE_CHANNEL_ID
-
-    print("Bot running. Use /start. DRY_RUN =", DRY_RUN)
-    app.run_polling(allowed_updates=Update.ALL_TYPES)
-
-
-if __name__ == "__main__":
-    main()
+print("Bot running...")
+bot.infinity_polling()
