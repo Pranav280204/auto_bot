@@ -71,7 +71,7 @@ print(f"Connected to Polymarket with wallet: {WALLET_ADDRESS[:6]}...{WALLET_ADDR
 print(f"Dry run mode: {DRY_RUN}")
 
 # Twitter monitoring
-TARGET_ACCOUNT = "elonmusk"
+TARGET_ACCOUNT = os.getenv("TARGET_ACCOUNT", "elonmusk")
 CHECK_INTERVAL = 0.5  # Aggressive polling for maximum speed
 LAST_CHECKED_TIME = datetime.now(timezone.utc)
 SEEN_TWEET_IDS = set()
