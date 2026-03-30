@@ -63,7 +63,7 @@ ERC1155_ABI = [
 ]
 
 # ---------- Conversation states ----------
-SLUG, MARKET_IDX, OUTCOME_IDX, MODE_CHOICE, ACTION, AMOUNT, CONFIRM, SELL_CHOICE, BUY_AFTER_YN, BUY_AMOUNT, START_MONITOR = range(11)
+SLUG, MARKET_IDX, OUTCOME_IDX, MODE_CHOICE, ACTION, AMOUNT, CONFIRM, SELL_CHOICE, BUY_AFTER_YN, BUY_AMOUNT = range(10)
 
 # ---------- Helpers ----------
 def fetch_active_markets(slug):
@@ -209,14 +209,12 @@ async def monitor_youtube_and_trigger(application: Application):
                     token_buy = application.bot_data.get("token_id_buy")
                     buy_usdc = application.bot_data.get("buy_usdc", 0)
 
-                    # SELL first
                     if sell_shares > 0 and token_sell:
                         t0 = time.time()
                         resp = place_market_order(token_sell, sell_shares, SELL)
                         took = time.time() - t0
                         trade_log.append(f"SELL {sell_shares:.6f} shares (took {took:.3f}s) | resp={resp}")
 
-                    # BUY after sell
                     if buy_usdc > 0 and token_buy:
                         t0 = time.time()
                         resp = place_market_order(token_buy, buy_usdc, BUY)
@@ -227,10 +225,7 @@ async def monitor_youtube_and_trigger(application: Application):
 
             # Telegram heartbeat
             now_ts = time.time()
-            time_since_last_msg = now_ts - last_telegram_time
-            should_send = time_since_last_msg >= TELEGRAM_HEARTBEAT
-
-            if should_send:
+            if now_ts - last_telegram_time >= TELEGRAM_HEARTBEAT:
                 msg_lines = [
                     f"📊 MrBeast Subscriber Monitor",
                     f"Time: {now.strftime('%H:%M:%S')} UTC",
@@ -259,10 +254,19 @@ async def monitor_youtube_and_trigger(application: Application):
 
     print("YouTube monitor: stopped")
 
-# ---------- Telegram conversation handlers ----------
+# ---------- Telegram Handlers ----------
 async def start(update: Update, context: ContextTypes.DEFAULT_TYPE):
     await update.message.reply_text("Enter Polymarket event slug:")
     return SLUG
+
+async def stop(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    """Stop monitoring and end conversation"""
+    if context.application.bot_data.get("yt_monitoring", False):
+        context.application.bot_data["yt_monitoring"] = False
+        await update.message.reply_text("⏹️ YouTube monitoring stopped.")
+    else:
+        await update.message.reply_text("✅ No active monitoring to stop.")
+    return ConversationHandler.END
 
 async def got_slug(update: Update, context: ContextTypes.DEFAULT_TYPE):
     slug = update.message.text.strip()
@@ -417,6 +421,33 @@ async def got_buy_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
         await update.message.reply_text("Invalid amount. Enter numeric USDC value:")
         return BUY_AMOUNT
 
+async def got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
+    try:
+        amount_str = update.message.text.strip()
+        normal_action = context.user_data.get('normal_action')
+
+        token_id = context.user_data['token_id']
+
+        if normal_action == 'buy':
+            usdc_amount = float(amount_str)
+            await update.message.reply_text(f"Placing BUY order for ${usdc_amount:.2f}...")
+            resp = place_market_order(token_id, usdc_amount, BUY)
+        else:  # sell
+            if amount_str in ['25', '50', '100']:
+                percent = int(amount_str) / 100.0
+                bal = context.user_data.get('balance', 0.0)
+                shares = bal * percent
+            else:
+                shares = float(amount_str)
+            await update.message.reply_text(f"Placing SELL order for {shares:.6f} shares...")
+            resp = place_market_order(token_id, shares, SELL)
+
+        await update.message.reply_text(f"Order response: {resp}")
+        return ConversationHandler.END
+    except Exception as e:
+        await update.message.reply_text(f"Invalid amount: {e}\nPlease enter a valid number.")
+        return AMOUNT
+
 async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT_TYPE):
     app = context.application
     user = context.user_data
@@ -425,8 +456,8 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
     app.bot_data['sell_shares'] = user.get('sell_shares', 0.0)
 
     # Determine buy token (opposite outcome if possible)
-    token_buy = None
     token_ids = user.get('token_ids', [])
+    token_buy = None
     if len(token_ids) >= 2:
         sel_tok = user.get('token_id')
         for t in token_ids:
@@ -438,17 +469,6 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
 
     app.bot_data['token_id_buy'] = token_buy
     app.bot_data['buy_usdc'] = user.get('buy_usdc', 0.0)
-    app.bot_data['from_outcome'] = user.get('outcome')
-
-    # Set target outcome name
-    if token_buy and token_buy != user.get('token_id'):
-        try:
-            idx_buy = user['token_ids'].index(token_buy)
-            app.bot_data['target_outcome'] = user['outcomes'][idx_buy]
-        except:
-            app.bot_data['target_outcome'] = "Target"
-    else:
-        app.bot_data['target_outcome'] = user.get('outcome')
 
     app.bot_data['chat_id'] = update.effective_chat.id
     app.bot_data['yt_monitoring'] = True
@@ -457,47 +477,13 @@ async def start_trigger_monitoring(update: Update, context: ContextTypes.DEFAULT
 
     app.create_task(monitor_youtube_and_trigger(app))
 
-    await update.message.reply_text("🚀 Monitoring started. Will act when subscriber count changes.")
+    await update.message.reply_text("🚀 Monitoring started. Will act when subscriber count changes.\nUse /stop to stop monitoring.")
     return ConversationHandler.END
-
-# Normal buy/sell handlers (incomplete in original, added basic versions)
-async def got_amount(update: Update, context: ContextTypes.DEFAULT_TYPE):
-    try:
-        amount_str = update.message.text.strip()
-        mode = context.user_data.get('mode')
-        normal_action = context.user_data.get('normal_action')
-
-        if normal_action == 'buy':
-            usdc_amount = float(amount_str)
-            token_id = context.user_data['token_id']
-            await update.message.reply_text(f"Placing BUY order for ${usdc_amount:.2f}...")
-            resp = place_market_order(token_id, usdc_amount, BUY)
-            await update.message.reply_text(f"Buy order response: {resp}")
-        elif normal_action == 'sell':
-            if amount_str in ['25', '50', '100']:
-                percent = int(amount_str) / 100.0
-                bal = context.user_data.get('balance', 0.0)
-                shares = bal * percent
-            else:
-                shares = float(amount_str)
-            token_id = context.user_data['token_id']
-            await update.message.reply_text(f"Placing SELL order for {shares:.6f} shares...")
-            resp = place_market_order(token_id, shares, SELL)
-            await update.message.reply_text(f"Sell order response: {resp}")
-
-        return ConversationHandler.END
-    except Exception as e:
-        await update.message.reply_text(f"Invalid amount: {e}")
-        return AMOUNT
 
 # ---------- Main ----------
 def main():
-    if not TELEGRAM_BOT_TOKEN:
-        raise ValueError("TELEGRAM_BOT_TOKEN is required")
-
     application = Application.builder().token(TELEGRAM_BOT_TOKEN).build()
 
-    # Conversation handler
     conv_handler = ConversationHandler(
         entry_points=[CommandHandler("start", start)],
         states={
@@ -512,13 +498,21 @@ def main():
             BUY_AFTER_YN: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_buy_after_yn)],
             BUY_AMOUNT: [MessageHandler(filters.TEXT & ~filters.COMMAND, got_buy_amount)],
         },
-        fallbacks=[],
+        fallbacks=[
+            CommandHandler("stop", stop),
+            CommandHandler("cancel", stop),
+        ],
+        allow_reentry=True,
     )
 
+    # Global stop command (works even outside conversation)
+    application.add_handler(CommandHandler("stop", stop))
     application.add_handler(conv_handler)
 
-    print("Bot starting...")
-    application.run_polling()
+    print("Bot started successfully!")
+    print("Commands: /start - Begin setup | /stop - Stop monitoring")
+    application.run_polling(allowed_updates=Update.ALL_TYPES)
+
 
 if __name__ == "__main__":
     main()
