@@ -25,14 +25,41 @@ from telegram.request import HTTPXRequest
 load_dotenv()
 
 # Config
-PRIVATE_KEY = os.getenv("PRIVATE_KEY")
-WALLET_ADDRESS = os.getenv("WALLET_ADDRESS")
-DRY_RUN = os.getenv("DRY_RUN", "False").lower() == "true"
-TELEGRAM_BOT_TOKEN = os.getenv("TELEGRAM_BOT_TOKEN")
-TWITTER_API_KEY = os.getenv("TWITTER_API_KEY")
+def read_env(*names):
+    """Return the first non-empty env var value among provided names."""
+    for name in names:
+        raw = os.getenv(name)
+        if raw is None:
+            continue
+        value = raw.strip().strip('"').strip("'")
+        if value:
+            return value
+    return None
 
-if not all([PRIVATE_KEY, WALLET_ADDRESS, TELEGRAM_BOT_TOKEN, TWITTER_API_KEY]):
-    raise ValueError("Missing required env variables")
+PRIVATE_KEY = read_env("PRIVATE_KEY", "POLYMARKET_PRIVATE_KEY", "PK")
+WALLET_ADDRESS = read_env("WALLET_ADDRESS", "POLYMARKET_WALLET_ADDRESS", "FUNDER")
+DRY_RUN = read_env("DRY_RUN") or "False"
+DRY_RUN = DRY_RUN.lower() in {"1", "true", "yes", "on"}
+TELEGRAM_BOT_TOKEN = read_env("TELEGRAM_BOT_TOKEN", "TELEGRAM_TOKEN", "BOT_TOKEN")
+TWITTER_API_KEY = read_env("TWITTER_API_KEY", "X_API_KEY", "TWITTERAPI_IO_KEY")
+
+required_env = {
+    "PRIVATE_KEY": PRIVATE_KEY,
+    "WALLET_ADDRESS": WALLET_ADDRESS,
+    "TELEGRAM_BOT_TOKEN": TELEGRAM_BOT_TOKEN,
+    "TWITTER_API_KEY": TWITTER_API_KEY,
+}
+missing_env = [name for name, value in required_env.items() if not value]
+if missing_env:
+    raise ValueError(
+        "Missing required env variables: "
+        + ", ".join(missing_env)
+        + ". Also accepted aliases: "
+        + "PRIVATE_KEY/POLYMARKET_PRIVATE_KEY/PK, "
+        + "WALLET_ADDRESS/POLYMARKET_WALLET_ADDRESS/FUNDER, "
+        + "TELEGRAM_BOT_TOKEN/TELEGRAM_TOKEN/BOT_TOKEN, "
+        + "TWITTER_API_KEY/X_API_KEY/TWITTERAPI_IO_KEY"
+    )
 
 # Constants
 GAMMA_API = "https://gamma-api.polymarket.com"
